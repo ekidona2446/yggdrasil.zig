@@ -7,6 +7,13 @@ pub const version = @import("version.zig");
 pub const proto = @import("proto.zig");
 pub const core = @import("core.zig");
 pub const links = @import("links.zig");
+pub const firewall = @import("firewall.zig");
+pub const ipv6rwc = @import("ipv6rwc.zig");
+pub const admin = @import("admin.zig");
+pub const tls = @import("tls.zig");
+pub const tls_wolfssl = @import("tls_wolfssl.zig");
+pub const multicast = @import("multicast.zig");
+pub const tun = @import("tun.zig");
 
 pub const Address = address.Address;
 pub const Subnet = address.Subnet;
@@ -21,4 +28,12 @@ test {
     _ = version;
     _ = proto;
     _ = core;
+    _ = links;
+    _ = firewall;
+    _ = ipv6rwc;
+    _ = admin;
+    _ = tls;
+    _ = tls_wolfssl;
+    _ = multicast;
+    _ = tun;
 }

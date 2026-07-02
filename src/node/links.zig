@@ -57,22 +57,11 @@ pub fn parsePeerURI(uri: []const u8) !struct { scheme: []const u8, host: []const
     const addr_part = if (std.mem.indexOfScalar(u8, rest, '?')) |qpos| rest[0..qpos] else rest;
 
     // Extract host and port
-    const host = if (addr_part[0] == '[') blk: {
-        const closing = std.mem.indexOfScalar(u8, addr_part, ']') orelse return error.InvalidURI;
-        const after_bracket = addr_part[closing + 1 ..];
-        if (after_bracket.len == 0 or after_bracket[0] != ':') return error.InvalidURI;
-        const port_str = after_bracket[1..];
-        break :blk .{ .host = addr_part[1..closing], .port = try std.fmt.parseInt(u16, port_str, 10) };
-    } else blk: {
-        const colon = std.mem.lastIndexOfScalar(u8, addr_part, ':') orelse return error.InvalidURI;
-        const port_str = addr_part[colon + 1 ..];
-        break :blk .{ .host = addr_part[0..colon], .port = try std.fmt.parseInt(u16, port_str, 10) };
-    };
-
+    const hp = extractHostPort(addr_part) catch return error.InvalidURI;
     return .{
         .scheme = scheme,
-        .host = host.host,
-        .port = host.port,
+        .host = hp.host,
+        .port = hp.port,
         .options = LinkOptions{},
     };
 }
@@ -165,3 +154,20 @@ test "handshake success" {
     try testing.expectEqualSlices(u8, &id_a.public_key, &decoded_a.public_key);
     try testing.expectEqualSlices(u8, &id_b.public_key, &decoded_b.public_key);
 }
+
+
+fn extractHostPort(addr_part: []const u8) !HostPort {
+    if (addr_part[0] == '[') {
+        const closing = std.mem.indexOfScalar(u8, addr_part, ']') orelse return error.InvalidURI;
+        const after_bracket = addr_part[closing + 1 ..];
+        if (after_bracket.len == 0 or after_bracket[0] != ':') return error.InvalidURI;
+        const port_str = after_bracket[1..];
+        return HostPort{ .host = addr_part[1..closing], .port = try std.fmt.parseInt(u16, port_str, 10) };
+    } else {
+        const colon = std.mem.lastIndexOfScalar(u8, addr_part, ':') orelse return error.InvalidURI;
+        const port_str = addr_part[colon + 1 ..];
+        return HostPort{ .host = addr_part[0..colon], .port = try std.fmt.parseInt(u16, port_str, 10) };
+    }
+}
+
+const HostPort = struct { host: []const u8, port: u16 };

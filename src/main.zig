@@ -1,4 +1,4 @@
-//! yggdrasil.zig node entrypoint.
+//! yggdrasil-zig node entrypoint.
 
 const std = @import("std");
 const ironwood = @import("ironwood");
@@ -12,11 +12,11 @@ pub fn main() !void {
     const subnet = node.subnetForKey(&id.public_key);
 
     std.debug.print("yggdrasil.zig {s}\n", .{"0.0.1-dev"});
-    std.debug.print("  public_key: ", .{});
+    std.debug.print("public key: ", .{});
     printHex(&id.public_key);
-    std.debug.print("\n  address:    ", .{});
+    std.debug.print("\naddress:    ", .{});
     printAddrBytes(&addr.bytes);
-    std.debug.print("\n  subnet:     ", .{});
+    std.debug.print("\nsubnet:     ", .{});
     printSubnetBytes(&subnet.bytes);
     std.debug.print("/64\n", .{});
 
@@ -24,7 +24,7 @@ pub fn main() !void {
     var core = try node.Core.init(gpa, id, iw_cfg, "");
     defer core.deinit();
 
-    std.debug.print("  status:     running (press Ctrl+C to stop)\n", .{});
+    std.debug.print("status:     running (press Ctrl+C to stop)\n", .{});
 
     while (true) {
         try core.maintenance();

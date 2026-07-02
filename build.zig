@@ -57,6 +57,14 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("xev", xev_mod);
     exe.root_module.addImport("async", async_mod);
     exe.root_module.addImport("node", node_mod);
+
+    // Link WolfSSL statically
+    exe.root_module.addIncludePath(.{ .cwd_relative = "/home/user/wolfssl" });
+    exe.root_module.addLibraryPath(.{ .cwd_relative = "/home/user/wolfssl/src/.libs" });
+    exe.root_module.linkSystemLibrary("wolfssl", .{});
+    exe.root_module.linkSystemLibrary("m", .{});
+    exe.root_module.linkSystemLibrary("pthread", .{});
+
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
