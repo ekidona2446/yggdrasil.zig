@@ -1,4 +1,4 @@
-//! yggdrasil-zig node entrypoint.
+//! yggdrasil.zig node entrypoint.
 
 const std = @import("std");
 const ironwood = @import("ironwood");

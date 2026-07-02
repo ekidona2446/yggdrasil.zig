@@ -44,7 +44,7 @@ pub fn build(b: *std.Build) void {
     });
     node_mod.addImport("ironwood", ironwood);
 
-    // ---- executable -------------------------------------------------------
+    // ---- yggdrasil executable ---------------------------------------------
     const exe = b.addExecutable(.{
         .name = "yggdrasil",
         .root_module = b.createModule(.{
@@ -57,8 +57,6 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("xev", xev_mod);
     exe.root_module.addImport("async", async_mod);
     exe.root_module.addImport("node", node_mod);
-
-    // Link WolfSSL statically
     exe.root_module.addIncludePath(.{ .cwd_relative = "/home/user/wolfssl" });
     exe.root_module.addLibraryPath(.{ .cwd_relative = "/home/user/wolfssl/src/.libs" });
     exe.root_module.linkSystemLibrary("wolfssl", .{});
@@ -67,11 +65,37 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // ---- peer_probe tool --------------------------------------------------
+    const probe = b.addExecutable(.{
+        .name = "peer_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/peer_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    probe.root_module.addImport("ironwood", ironwood);
+    probe.root_module.addImport("node", node_mod);
+    probe.root_module.addIncludePath(.{ .cwd_relative = "/home/user/wolfssl" });
+    probe.root_module.addLibraryPath(.{ .cwd_relative = "/home/user/wolfssl/src/.libs" });
+    probe.root_module.linkSystemLibrary("wolfssl", .{});
+    probe.root_module.linkSystemLibrary("m", .{});
+    probe.root_module.linkSystemLibrary("pthread", .{});
+
+    b.installArtifact(probe);
+
+    // ---- steps ------------------------------------------------------------
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("run", "Run the yggdrasil node");
     run_step.dependOn(&run_cmd.step);
+
+    const probe_cmd = b.addRunArtifact(probe);
+    probe_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| probe_cmd.addArgs(args);
+    const probe_step = b.step("probe", "Probe a peer");
+    probe_step.dependOn(&probe_cmd.step);
 
     // ---- tests ------------------------------------------------------------
     const test_step = b.step("test", "Run unit tests");
