@@ -168,7 +168,7 @@ pub const ProtoHandler = struct {
     /// Clean up expired callbacks.
     pub fn cleanupExpired(self: *ProtoHandler) void {
         const now = monotonicNs();
-        var to_remove = std.ArrayListUnmanaged(PublicKey){};
+        var to_remove = std.ArrayListUnmanaged(PublicKey).empty;
         defer to_remove.deinit(self.gpa);
 
         var it = self.callbacks.iterator();

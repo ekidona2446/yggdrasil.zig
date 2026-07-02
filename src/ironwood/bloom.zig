@@ -47,6 +47,9 @@ inline fn fmix64(k_in: u64) u64 {
     return k;
 }
 
+/// MurmurHash3 x64 128-bit. Returns the 128-bit hash as a u128
+/// (low 64 bits = h1, high 64 bits = h2), matching `murmur3_x64_128`'s
+/// little-endian-style assembly used by the Rust `murmur3` crate.
 pub fn murmur3X64_128(data: []const u8, seed: u32) u128 {
     const c1: u64 = 0x87c37b91114253d5;
     const c2: u64 = 0x4cf5ad432745937f;
@@ -263,7 +266,7 @@ fn KeyMap(comptime V: type) type {
     return std.AutoHashMapUnmanaged(PublicKey, V);
 }
 
-/// Per-peer bloom filter tracking.
+/// Per-peer bloom filter tracking. Port of Rust `BloomInfo`.
 pub const BloomInfo = struct {
     /// What we advertise to this peer.
     send: BloomFilter,
@@ -293,7 +296,7 @@ pub const KeyBloom = struct {
     filter: BloomFilter,
 };
 
-/// Manages bloom filters for all peers.
+/// Manages bloom filters for all peers. Port of Rust `Blooms`.
 ///
 /// The `transform` callback corresponds to `Config.bloom_transform`; when
 /// `null` the identity function is used.

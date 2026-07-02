@@ -1,6 +1,6 @@
 //! Yggdrasil IPv6 addressing from ed25519 public keys.
 //!
-//! Wire-compatible with the Go reference implementation.  An ed25519 key is
+//! Wire-compatible with the reference implementation.  An ed25519 key is
 //! bitwise-inverted, then the leading 1-bits are counted (clamped to 255)
 //! and the remaining bits after the first 0-bit are packed into the address.
 
@@ -50,7 +50,7 @@ pub const Address = struct {
     }
 
     /// Format as IPv6 address string (e.g. "200:abcd::1").
-    pub fn format(self: Address, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+    pub fn format(self: Address, writer: anytype) !void {
         // Manual IPv6 formatting: 8 groups of 2 bytes in hex
         var started: bool = false;
         const delim = ":";

@@ -133,7 +133,7 @@ pub const Core = struct {
         );
         defer encrypted.session.deinitActions(self.gpa, session_actions);
 
-        var results = std.ArrayListUnmanaged(struct { source: PublicKey, data: []u8 }){};
+        var results = std.ArrayListUnmanaged(struct { source: PublicKey, data: []u8 }).empty;
         errdefer {
             for (results.items) |r| self.gpa.free(r.data);
             results.deinit(self.gpa);

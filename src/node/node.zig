@@ -6,6 +6,7 @@ pub const config = @import("config.zig");
 pub const version = @import("version.zig");
 pub const proto = @import("proto.zig");
 pub const core = @import("core.zig");
+pub const links = @import("links.zig");
 
 pub const Address = address.Address;
 pub const Subnet = address.Subnet;

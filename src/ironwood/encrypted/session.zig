@@ -527,7 +527,7 @@ pub const SessionManager = struct {
         our_ed_kp: *const Crypto,
     ) ![]OutAction {
         if (data.len == 0) return &[_]OutAction{};
-        var actions = std.ArrayListUnmanaged(OutAction){};
+        var actions = std.ArrayListUnmanaged(OutAction).empty;
         errdefer { for (actions.items) |*a| a.deinit(self.gpa); actions.deinit(self.gpa); }
 
         switch (data[0]) {
@@ -547,7 +547,7 @@ pub const SessionManager = struct {
         msg: []const u8,
         our_ed_kp: *const Crypto,
     ) ![]OutAction {
-        var actions = std.ArrayListUnmanaged(OutAction){};
+        var actions = std.ArrayListUnmanaged(OutAction).empty;
         errdefer { for (actions.items) |*a| a.deinit(self.gpa); actions.deinit(self.gpa); }
 
         if (self.sessions.getPtr(dest.*)) |session| {
@@ -658,7 +658,7 @@ pub const SessionManager = struct {
     }
 
     pub fn cleanupExpired(self: *SessionManager) void {
-        var to_remove = std.ArrayListUnmanaged(PublicKey){};
+        var to_remove = std.ArrayListUnmanaged(PublicKey).empty;
         defer to_remove.deinit(self.gpa);
         {
             var it = self.sessions.iterator();
@@ -719,7 +719,12 @@ fn monotonicNs() u64 {
         if (std.os.linux.clock_gettime(.MONOTONIC, &ts) == 0)
             return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
     }
-    return @intCast(std.time.nanoTimestamp());
+    // Fallback: use a simple counter
+    const static = struct {
+        var counter: u64 = 0;
+    };
+    static.counter += 1;
+    return static.counter;
 }
 
 // ---------------------------------------------------------------------------
