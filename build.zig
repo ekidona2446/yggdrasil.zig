@@ -1,0 +1,95 @@
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    // ---- dependencies -----------------------------------------------------
+    const libxev = b.dependency("libxev", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const xev_mod = libxev.module("xev");
+
+    // ---- shared utilities -------------
+    const util_mod = b.addModule("util", .{
+        .root_source_file = b.path("src/util/util.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // ---- async runtime module (libxev) ------------------------------------
+    const async_mod = b.addModule("async", .{
+        .root_source_file = b.path("src/async/async.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    async_mod.addImport("xev", xev_mod);
+
+    // ---- ironwood module --------------------------------------------------
+    const ironwood = b.addModule("ironwood", .{
+        .root_source_file = b.path("src/ironwood/ironwood.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ironwood.addImport("xev", xev_mod);
+    ironwood.addImport("async", async_mod);
+    ironwood.addImport("util", util_mod);
+
+    // ---- executable (placeholder node entrypoint) -------------------------
+    const exe = b.addExecutable(.{
+        .name = "yggdrasil",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    exe.root_module.addImport("ironwood", ironwood);
+    exe.root_module.addImport("xev", xev_mod);
+    exe.root_module.addImport("async", async_mod);
+    b.installArtifact(exe);
+
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_cmd.addArgs(args);
+    const run_step = b.step("run", "Run the yggdrasil node");
+    run_step.dependOn(&run_cmd.step);
+
+    // ---- tests ------------------------------------------------------------
+    const test_step = b.step("test", "Run unit tests");
+
+    const ironwood_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/ironwood/ironwood.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    ironwood_tests.root_module.addImport("xev", xev_mod);
+    ironwood_tests.root_module.addImport("async", async_mod);
+    ironwood_tests.root_module.addImport("util", util_mod);
+    const run_ironwood_tests = b.addRunArtifact(ironwood_tests);
+    test_step.dependOn(&run_ironwood_tests.step);
+
+    const util_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/util/util.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_util_tests = b.addRunArtifact(util_tests);
+    test_step.dependOn(&run_util_tests.step);
+
+    const async_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/async/async.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    async_tests.root_module.addImport("xev", xev_mod);
+    const run_async_tests = b.addRunArtifact(async_tests);
+    test_step.dependOn(&run_async_tests.step);
+}

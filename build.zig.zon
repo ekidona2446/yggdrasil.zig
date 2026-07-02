@@ -1,0 +1,17 @@
+.{
+    .name = .yggdrasil_zig,
+    .version = "0.0.1",
+    .fingerprint = 0xe7001a12fe36bba,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .libxev = .{
+            .url = "https://github.com/mitchellh/libxev/archive/refs/heads/main.tar.gz",
+            .hash = "libxev-0.0.0-86vtcwIRFADbH4hk-EjROXxlrKIRPQdA41XiTSytYO-F",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
