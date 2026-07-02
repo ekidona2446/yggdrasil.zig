@@ -15,6 +15,8 @@ pub const signed = @import("signed.zig");
 pub const traffic = @import("traffic.zig");
 pub const pathfinder = @import("pathfinder.zig");
 pub const router = @import("router.zig");
+pub const encrypted = @import("encrypted/mod.zig");
+pub const peers = @import("peers.zig");
 
 // Primary public API re-exports.
 pub const Addr = types.Addr;

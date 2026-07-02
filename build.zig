@@ -36,7 +36,15 @@ pub fn build(b: *std.Build) void {
     ironwood.addImport("async", async_mod);
     ironwood.addImport("util", util_mod);
 
-    // ---- executable (placeholder node entrypoint) -------------------------
+    // ---- node module ------------------------------------------------------
+    const node_mod = b.addModule("node", .{
+        .root_source_file = b.path("src/node/node.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    node_mod.addImport("ironwood", ironwood);
+
+    // ---- executable -------------------------------------------------------
     const exe = b.addExecutable(.{
         .name = "yggdrasil",
         .root_module = b.createModule(.{
@@ -48,6 +56,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("ironwood", ironwood);
     exe.root_module.addImport("xev", xev_mod);
     exe.root_module.addImport("async", async_mod);
+    exe.root_module.addImport("node", node_mod);
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -92,4 +101,17 @@ pub fn build(b: *std.Build) void {
     async_tests.root_module.addImport("xev", xev_mod);
     const run_async_tests = b.addRunArtifact(async_tests);
     test_step.dependOn(&run_async_tests.step);
+
+    const node_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/node/node.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    node_tests.root_module.addImport("ironwood", ironwood);
+    node_tests.root_module.addImport("xev", xev_mod);
+    node_tests.root_module.addImport("async", async_mod);
+    const run_node_tests = b.addRunArtifact(node_tests);
+    test_step.dependOn(&run_node_tests.step);
 }

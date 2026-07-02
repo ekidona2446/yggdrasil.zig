@@ -15,6 +15,6 @@ pub fn main() !void {
     const id = ironwood.Crypto.generate();
     const addr = ironwood.Addr.fromPublicKey(id.public_key);
 
-    std.debug.print("yggdrasil-zig (ironwood core) — Zig {s}\n", .{@import("builtin").zig_version_string});
+    std.debug.print("yggdrasil.zig (ironwood core) — Zig {s}\n", .{@import("builtin").zig_version_string});
     std.debug.print("ephemeral node address: {f}\n", .{addr});
 }

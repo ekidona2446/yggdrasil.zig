@@ -327,7 +327,7 @@ pub const Router = struct {
         self.res_seqs.deinit(self.gpa);
     }
 
-    fn selfKey(self: *const Router) PublicKey {
+    pub fn selfKey(self: *const Router) PublicKey {
         return self.crypto.public_key;
     }
 
@@ -570,7 +570,7 @@ pub const Router = struct {
     /// Process a tree announcement. Returns true if accepted (CRDT ordering).
     pub fn update(self: *Router, ann: *const RouterAnnounce) Allocator.Error!bool {
         if (self.infos.getPtr(ann.key)) |info| {
-            // CRDT ordering — identical to Go/Rust; do not change.
+            // CRDT ordering — identical to Go; do not change.
             if (info.seq > ann.seq) {
                 return false;
             } else if (info.seq < ann.seq) {

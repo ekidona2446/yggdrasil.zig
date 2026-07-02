@@ -29,8 +29,6 @@ pub const RECV_CHANNEL_SIZE: usize = 64;
 ///
 /// Signs the concatenation `[to_key || msg]` with our identity and returns a
 /// freshly-allocated buffer `[signature(64) || msg]`. Caller owns the result.
-///
-/// Matches the Rust `SignedPacketConn::sign`.
 pub fn sign(gpa: Allocator, id: *const Crypto, to_key: *const PublicKey, msg: []const u8) Allocator.Error![]u8 {
     // Build the signing input: to_key || msg.
     var sig_input = try gpa.alloc(u8, PUBLIC_KEY_SIZE + msg.len);
@@ -53,8 +51,6 @@ pub fn sign(gpa: Allocator, id: *const Crypto, to_key: *const PublicKey, msg: []
 /// Verifies the signature over `[our_pub || msg]` against the sender's key
 /// `from_key`. On success returns a freshly-allocated copy of `msg` (caller
 /// owns it); on failure (too short or bad signature) returns `null`.
-///
-/// Matches the Rust `SignedPacketConn::unpack`.
 pub fn unpack(
     gpa: Allocator,
     our_pub: *const PublicKey,

@@ -102,9 +102,8 @@ const PqPacketInfo = struct {
     time: Instant,
 };
 
-/// A FIFO deque backed by a growable buffer with a moving head index, mirroring
-/// Rust's `VecDeque` usage here (push_back / pop_front / front). Compacts when
-/// the dead prefix grows large to bound memory.
+/// A FIFO deque backed by a growable buffer with a moving head index.
+/// Compacts when the dead prefix grows large to bound memory.
 const Deque = struct {
     items: std.ArrayListUnmanaged(PqPacketInfo) = .empty,
     head: usize = 0,
