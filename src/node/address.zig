@@ -76,6 +76,18 @@ pub const Subnet = struct {
         return self.bytes[0] == SUBNET_PREFIX;
     }
 
+    /// Format as IPv6 subnet prefix string (e.g. "300:abcd:0:0").
+    pub fn format(self: Subnet, writer: anytype) !void {
+        var started: bool = false;
+        for (0..4) |i| {
+            const hi = self.bytes[i * 2];
+            const lo = self.bytes[i * 2 + 1];
+            if (started) try writer.writeAll(":");
+            try writer.print("{x:0>2}{x:0>2}", .{ hi, lo });
+            started = true;
+        }
+    }
+
     /// Reconstruct a partial ed25519 public key from this subnet.
     pub fn getKey(self: *const Subnet) [32]u8 {
         var addr_bytes: [16]u8 = [_]u8{0} ** 16;
@@ -143,6 +155,22 @@ pub fn subnetForKey(public_key: *const [32]u8) Subnet {
     @memcpy(&subnet, addr.bytes[0..8]);
     subnet[0] |= 0x01;
     return .{ .bytes = subnet };
+}
+
+/// Bloom-filter key transform used by the reference implementation:
+/// `SubnetForKey(key).GetKey()`. Nodes that share the same /64 subnet (i.e.
+/// the same first `ones` leading-1-bits + one 0-bit prefix in the inverted
+/// key) collapse to the same bloom-filter entry, so a lookup for *any* key
+/// in that subnet reaches a node that owns it. This function signature
+/// matches `ironwood.config.BloomTransformFn` and MUST be installed via
+/// `ironwood.Config.bloom_transform` for path lookups to work at all --
+/// leaving it as the default identity transform means our bloom filters
+/// never match lookups originated by real Yggdrasil peers (which always use
+/// this transform), so `path_lookup` messages are silently dropped as
+/// "no matching multicast target" and no `path_notify` is ever produced.
+pub fn bloomKeyTransform(key: [32]u8) [32]u8 {
+    const subnet = subnetForKey(&key);
+    return subnet.getKey();
 }
 
 // ---------------------------------------------------------------------------

@@ -990,6 +990,14 @@ pub const Router = struct {
         var targets = std.ArrayListUnmanaged(PublicKey).empty;
         defer targets.deinit(self.gpa);
         try self.blooms.getMulticastTargets(from_key, &lookup_msg.dest, &targets, self.gpa);
+        if (@import("builtin").mode == .Debug) {
+            var peer_it = self.peers.keyIterator();
+            var n_on_tree: usize = 0;
+            while (peer_it.next()) |pk| {
+                if (self.blooms.isOnTree(pk)) n_on_tree += 1;
+            }
+            std.debug.print("[router] handleLookup dest_x={x} peers={d} on_tree={d} targets={d}\n", .{ self.blooms.xKey(&lookup_msg.dest), self.peers.count(), n_on_tree, targets.items.len });
+        }
         for (targets.items) |target_key| {
             if (self.bestPeerForKey(&target_key)) |peer_id| {
                 const dup_from = try self.gpa.dupe(PeerPort, lookup_msg.from);

@@ -14,6 +14,8 @@ pub const tls = @import("tls.zig");
 pub const tls_wolfssl = @import("tls_wolfssl.zig");
 pub const multicast = @import("multicast.zig");
 pub const tun = @import("tun.zig");
+pub const dns = @import("dns.zig");
+pub const network = @import("network.zig");
 
 pub const Address = address.Address;
 pub const Subnet = address.Subnet;
@@ -36,4 +38,6 @@ test {
     _ = tls_wolfssl;
     _ = multicast;
     _ = tun;
+    _ = dns;
+    _ = network;
 }
