@@ -8,6 +8,10 @@
             .url = "https://github.com/mitchellh/libxev/archive/refs/heads/main.tar.gz",
             .hash = "libxev-0.0.0-86vtcwIRFADbH4hk-EjROXxlrKIRPQdA41XiTSytYO-F",
         },
+        .wolfssl = .{
+            .url = "https://github.com/wolfSSL/wolfssl/archive/38a4143a480b642464074a42bfd6c09666556e8b.tar.gz",
+            .hash = "N-V-__8AAA5Yoge4Qr6vEDwUx1zqEDlOBAndc-uMmoVFGDjO",
+        },
     },
     .paths = .{
         "build.zig",
