@@ -10,12 +10,14 @@ const xev = @import("xev");
 const ironwood = @import("ironwood");
 const node = @import("node.zig");
 const dns = @import("dns.zig");
+const tls_wolfssl = @import("tls_wolfssl.zig");
 
 const Core = node.core.Core;
 const Metadata = node.version.Metadata;
 const PublicKey = ironwood.PublicKey;
 const PeerId = ironwood.router.PeerId;
 const wire = ironwood.wire;
+const TlsConn = tls_wolfssl.TlsConn;
 
 pub const HANDSHAKE_TIMEOUT_NS: u64 = 10 * std.time.ns_per_s;
 pub const DEFAULT_BACKOFF_LIMIT_NS: u64 = 4096 * std.time.ns_per_s;
@@ -51,6 +53,12 @@ pub const LinkOptions = struct {
     password: []const u8 = &.{},
     max_backoff_ns: u64 = DEFAULT_BACKOFF_LIMIT_NS,
     persistent: bool = true,
+    /// Whether to wrap this link in a real TLS 1.3 session (set for
+    /// "tls://" peer/listener URIs, unset for "tcp://").
+    use_tls: bool = false,
+    /// Optional TLS SNI hostname override (client-side only). Falls back to
+    /// the dialed hostname when null and `use_tls` is set.
+    tls_sni: ?[]const u8 = null,
 };
 
 fn logInfo(comptime fmt: []const u8, args: anytype) void {
@@ -58,11 +66,14 @@ fn logInfo(comptime fmt: []const u8, args: anytype) void {
 }
 
 // ---------------------------------------------------------------------------
-// Peer URI parsing (tcp://host:port, tls://host:port -- tls falls back to tcp
-// framing since our wolfSSL TLS integration for the stream itself is a
-// follow-up; the ironwood-level session crypto already authenticates and
-// encrypts all traffic end-to-end, so plain TCP framing carries the same
-// security properties for the mesh payload).
+// Peer URI parsing (tcp://host:port, tls://host:port). "tls" wraps the same
+// underlying TCP byte stream in a real TLS 1.3 session via wolfSSL (see
+// tls_wolfssl.zig), with every node presenting a self-signed certificate
+// bound to its own Ed25519 identity key -- peer *authentication* still
+// happens one layer up, in the signed ironwood metadata handshake, exactly
+// like the reference implementations; TLS here adds transport
+// confidentiality/integrity and SNI support for traversing SNI-aware
+// middleboxes.
 // ---------------------------------------------------------------------------
 
 pub const ParsedURI = struct {
@@ -97,6 +108,15 @@ fn extractHostPort(addr_part: []const u8) !HostPort {
     }
 }
 
+/// One entry in a `PeerConn`'s outbound write queue: the raw bytes to send
+/// on the wire (post-encryption, for TLS links) plus, if these bytes
+/// correspond to exactly one decoded ironwood wire frame, its packet type
+/// (used for keepalive/timeout bookkeeping in `onWrite`).
+const WriteItem = struct {
+    data: []u8,
+    packet_type: ?wire.PacketType,
+};
+
 // ---------------------------------------------------------------------------
 // PeerConn: one TCP connection to/from a peer, post-handshake
 // ---------------------------------------------------------------------------
@@ -109,15 +129,33 @@ const PeerConn = struct {
     /// Intrusive list node embedded directly (no separate allocation).
     list_node: std.DoublyLinkedList.Node = .{},
 
-    // Read state: growable buffer holding not-yet-fully-parsed bytes.
+    // Read state: growable buffer holding not-yet-fully-parsed bytes (always
+    // *decrypted* plaintext -- the ironwood handshake/wire-frame parser
+    // never sees raw TLS ciphertext).
     read_buf: std.ArrayListUnmanaged(u8) = .empty,
     read_scratch: [READ_BUF_SIZE]u8 = undefined,
     read_completion: xev.Completion = undefined,
 
+    // TLS state (only set for "tls://" links; null means plain TCP).
+    use_tls: bool = false,
+    tls: ?*TlsConn = null,
+    tls_handshake_done: bool = false,
+    /// Priority/password to use for the *ironwood* Metadata handshake, sent
+    /// once the TLS handshake finishes (for plain TCP links this is used
+    /// immediately in `spawnConn` instead). Slices here are assumed to
+    /// outlive the connection, matching how `LinkOptions.password` is
+    /// already used elsewhere (CLI args / long-lived URI-derived strings).
+    pending_options: LinkOptions = .{},
+
     // Write state: a simple serial queue (one write in flight at a time) --
     // sufficient for our moderate traffic volumes and much simpler than
     // libxev's intrusive WriteQueue to get right across zig 0.16 API churn.
-    write_queue: std.ArrayListUnmanaged([]u8) = .empty,
+    // Each item carries the *raw* bytes actually written to the socket
+    // (ciphertext, for TLS links) plus the logical ironwood packet type (if
+    // any) for keepalive/timeout bookkeeping -- decided at queue time,
+    // before encryption, since ciphertext can't be decoded back into a
+    // wire frame the way plaintext can.
+    write_queue: std.ArrayListUnmanaged(WriteItem) = .empty,
     write_in_flight: bool = false,
     write_completion: xev.Completion = undefined,
 
@@ -175,9 +213,10 @@ const PeerConn = struct {
     fn destroy(self: *PeerConn) void {
         const gpa = self.manager.gpa;
         self.read_buf.deinit(gpa);
-        for (self.write_queue.items) |w| gpa.free(w);
+        for (self.write_queue.items) |w| gpa.free(w.data);
         self.write_queue.deinit(gpa);
         self.keepalive_timer.deinit();
+        if (self.tls) |t| t.deinit();
         gpa.destroy(self);
     }
 };
@@ -193,6 +232,16 @@ const DialState = struct {
     timer_completion: xev.Completion = undefined,
     connect_completion: xev.Completion = undefined,
     tcp: xev.TCP = undefined,
+};
+
+// ---------------------------------------------------------------------------
+// TLS state: shared wolfSSL contexts + our identity certificate
+// ---------------------------------------------------------------------------
+
+const TlsState = struct {
+    client_ctx: *tls_wolfssl.WOLFSSL_CTX,
+    server_ctx: *tls_wolfssl.WOLFSSL_CTX,
+    identity: tls_wolfssl.IdentityCert,
 };
 
 // ---------------------------------------------------------------------------
@@ -218,8 +267,42 @@ pub const NetworkManager = struct {
     /// Fired whenever the tree topology changes materially (new peer up/down).
     stop: bool = false,
 
+    /// wolfSSL contexts + our self-signed identity certificate, created
+    /// lazily on first TLS use (most nodes never dial/listen on "tls://" at
+    /// all, so we avoid the wolfSSL_Init()/cert-gen cost otherwise).
+    tls_state: ?TlsState = null,
+
     pub fn init(gpa: std.mem.Allocator, loop: *xev.Loop, core: *Core, our_id: ironwood.Crypto) NetworkManager {
         return .{ .gpa = gpa, .loop = loop, .core = core, .our_id = our_id };
+    }
+
+    /// Lazily initialize wolfSSL + generate our TLS identity certificate
+    /// (bound to `our_id`'s Ed25519 key) the first time a "tls://" peer or
+    /// listener is configured.
+    fn ensureTlsState(self: *NetworkManager) !*TlsState {
+        if (self.tls_state) |*s| return s;
+
+        try tls_wolfssl.globalInit();
+        errdefer tls_wolfssl.globalDeinit();
+
+        var key_hex_buf: [64]u8 = undefined;
+        const key_hex = std.fmt.bufPrint(&key_hex_buf, "{x}", .{self.our_id.public_key}) catch unreachable;
+
+        var ident = try tls_wolfssl.generateIdentityCert(self.gpa, self.our_id.key_pair.secret_key.seed(), key_hex);
+        errdefer ident.deinit(self.gpa);
+
+        const client_ctx = try tls_wolfssl.newClientCtx();
+        errdefer tls_wolfssl.freeCtx(client_ctx);
+        try tls_wolfssl.configureIdentity(client_ctx, ident.cert_der, ident.key_der);
+        tls_wolfssl.installMemoryIO(client_ctx);
+
+        const server_ctx = try tls_wolfssl.newServerCtx();
+        errdefer tls_wolfssl.freeCtx(server_ctx);
+        try tls_wolfssl.configureIdentity(server_ctx, ident.cert_der, ident.key_der);
+        tls_wolfssl.installMemoryIO(server_ctx);
+
+        self.tls_state = .{ .client_ctx = client_ctx, .server_ctx = server_ctx, .identity = ident };
+        return &self.tls_state.?;
     }
 
     pub fn deinit(self: *NetworkManager) void {
@@ -230,6 +313,12 @@ pub const NetworkManager = struct {
         }
         for (self.listeners.items) |l| self.gpa.destroy(l);
         self.listeners.deinit(self.gpa);
+        if (self.tls_state) |*s| {
+            tls_wolfssl.freeCtx(s.client_ctx);
+            tls_wolfssl.freeCtx(s.server_ctx);
+            s.identity.deinit(self.gpa);
+            tls_wolfssl.globalDeinit();
+        }
         for (self.dials.items) |d| {
             self.gpa.free(d.host);
             self.gpa.destroy(d);
@@ -282,10 +371,13 @@ pub const NetworkManager = struct {
     // Outbound dialing with DNS + exponential backoff
     // -----------------------------------------------------------------
 
-    pub fn addOutboundPeer(self: *NetworkManager, uri: []const u8, options: LinkOptions) !void {
+    pub fn addOutboundPeer(self: *NetworkManager, uri: []const u8, options_in: LinkOptions) !void {
         const parsed = try parsePeerURI(uri);
         const host_dup = try self.gpa.dupe(u8, parsed.host);
         errdefer self.gpa.free(host_dup);
+
+        var options = options_in;
+        options.use_tls = std.mem.eql(u8, parsed.scheme, "tls");
 
         const dial = try self.gpa.create(DialState);
         dial.* = .{
@@ -373,12 +465,12 @@ pub const NetworkManager = struct {
         const addr = addrs[0];
 
         const listener = try self.gpa.create(ListenerState);
-        listener.* = .{ .manager = self, .tcp = try xev.TCP.init(addr) };
+        listener.* = .{ .manager = self, .tcp = try xev.TCP.init(addr), .use_tls = std.mem.eql(u8, parsed.scheme, "tls") };
         try listener.tcp.bind(addr);
         try listener.tcp.listen(128);
         try self.listeners.append(self.gpa, listener);
         listener.tcp.accept(self.loop, &listener.accept_completion, ListenerState, listener, onAccept);
-        logInfo("listening on {f}", .{addr});
+        logInfo("listening on {f} (tls={})", .{ addr, listener.use_tls });
     }
 
     fn onAccept(ud: ?*ListenerState, loop: *xev.Loop, c: *xev.Completion, r: xev.AcceptError!xev.TCP) xev.CallbackAction {
@@ -389,7 +481,7 @@ pub const NetworkManager = struct {
             listener.tcp.accept(loop, &listener.accept_completion, ListenerState, listener, onAccept);
             return .disarm;
         };
-        listener.manager.spawnConn(tcp, .{ .persistent = false }, null) catch |err| {
+        listener.manager.spawnConn(tcp, .{ .persistent = false, .use_tls = listener.use_tls }, null) catch |err| {
             logInfo("spawnConn (inbound) failed: {}", .{err});
         };
         // Re-arm the listener for the next incoming connection.
@@ -403,14 +495,35 @@ pub const NetworkManager = struct {
 
     fn spawnConn(self: *NetworkManager, tcp: xev.TCP, options: LinkOptions, dial: ?*DialState) !void {
         const conn = try self.gpa.create(PeerConn);
-        conn.* = .{ .manager = self, .tcp = tcp, .dial = dial, .keepalive_timer = try xev.Timer.init() };
+        conn.* = .{
+            .manager = self,
+            .tcp = tcp,
+            .dial = dial,
+            .keepalive_timer = try xev.Timer.init(),
+            .use_tls = options.use_tls,
+            .pending_options = options,
+        };
         self.conns.append(&conn.list_node);
 
-        // Send our handshake metadata immediately; queueWrite handles the
-        // async write via the same path used for post-handshake frames.
-        const meta = Metadata.init(self.our_id.public_key, options.priority);
-        const msg = try meta.encode(&self.our_id, options.password, self.gpa);
-        queueWrite(conn, msg);
+        if (options.use_tls) {
+            const state = try self.ensureTlsState();
+            const is_server = (dial == null);
+            const ctx = if (is_server) state.server_ctx else state.client_ctx;
+            const sni = if (is_server) null else (options.tls_sni orelse if (dial) |d| d.host else null);
+            conn.tls = try TlsConn.init(self.gpa, ctx, sni);
+            // Kick the handshake off; any resulting ciphertext is flushed
+            // by `pumpTlsHandshake`. The ironwood Metadata handshake is
+            // sent only once the TLS handshake itself completes (see
+            // `pumpTlsHandshake`).
+            try self.pumpTlsHandshake(conn, is_server);
+        } else {
+            // Plain TCP: send our ironwood handshake metadata immediately;
+            // queueWrite handles the async write via the same path used
+            // for post-handshake frames.
+            const meta = Metadata.init(self.our_id.public_key, options.priority);
+            const msg = try meta.encode(&self.our_id, options.password, self.gpa);
+            queueWrite(conn, msg);
+        }
 
         // Kick off the read loop; handshake bytes are parsed by
         // `tryParseHandshake` before we switch to wire-frame parsing.
@@ -420,6 +533,31 @@ pub const NetworkManager = struct {
         // Kick off the keepalive/timeout tick for this connection.
         conn.keepalive_active = true;
         conn.keepalive_timer.run(self.loop, &conn.keepalive_completion, KEEPALIVE_TICK_MS, PeerConn, conn, onKeepaliveTick);
+    }
+
+    /// Drive the TLS handshake state machine for `conn` one step, flushing
+    /// any resulting ciphertext to the raw socket. Once wolfSSL reports the
+    /// handshake finished, sends the ironwood Metadata handshake over the
+    /// now-encrypted channel.
+    fn pumpTlsHandshake(self: *NetworkManager, conn: *PeerConn, is_server: bool) !void {
+        const tls = conn.tls orelse return;
+        const result = tls.pumpHandshake(is_server);
+        if (tls.hasPendingCiphertext()) {
+            const bytes = try tls.drainCiphertext();
+            queueRawWrite(conn, bytes);
+        }
+        switch (result) {
+            .fatal, .closed => return error.TlsHandshakeFailed,
+            .want_read, .want_write => {}, // wait for more socket I/O
+            .ok => {
+                if (tls.isHandshakeDone() and !conn.tls_handshake_done) {
+                    conn.tls_handshake_done = true;
+                    const meta = Metadata.init(self.our_id.public_key, conn.pending_options.priority);
+                    const msg = try meta.encode(&self.our_id, conn.pending_options.password, self.gpa);
+                    queueWrite(conn, msg); // encrypted via conn.tls automatically
+                }
+            },
+        }
     }
 
     fn onKeepaliveTick(ud: ?*PeerConn, loop: *xev.Loop, c: *xev.Completion, r: xev.Timer.RunError!void) xev.CallbackAction {
@@ -543,21 +681,31 @@ pub const NetworkManager = struct {
             conn.maybeDestroy();
             return .disarm;
         }
-        const data = buf.slice[0..n];
-        conn.read_buf.appendSlice(conn.manager.gpa, data) catch {
-            conn.read_active = false;
-            conn.manager.closeConn(conn);
-            conn.maybeDestroy();
-            return .disarm;
-        };
+        const raw = buf.slice[0..n];
 
-        conn.manager.processBuffered(conn) catch |err| {
-            logInfo("frame processing error, dropping peer: {}", .{err});
-            conn.read_active = false;
-            conn.manager.closeConn(conn);
-            conn.maybeDestroy();
-            return .disarm;
-        };
+        if (conn.tls) |tls| {
+            conn.manager.handleTlsReadable(conn, tls, raw) catch |err| {
+                logInfo("tls processing error, dropping peer: {}", .{err});
+                conn.read_active = false;
+                conn.manager.closeConn(conn);
+                conn.maybeDestroy();
+                return .disarm;
+            };
+        } else {
+            conn.read_buf.appendSlice(conn.manager.gpa, raw) catch {
+                conn.read_active = false;
+                conn.manager.closeConn(conn);
+                conn.maybeDestroy();
+                return .disarm;
+            };
+            conn.manager.processBuffered(conn) catch |err| {
+                logInfo("frame processing error, dropping peer: {}", .{err});
+                conn.read_active = false;
+                conn.manager.closeConn(conn);
+                conn.maybeDestroy();
+                return .disarm;
+            };
+        }
 
         if (conn.closing) {
             conn.read_active = false;
@@ -567,6 +715,40 @@ pub const NetworkManager = struct {
         // Re-arm the read.
         conn.tcp.read(loop, &conn.read_completion, .{ .slice = &conn.read_scratch }, PeerConn, conn, onRead);
         return .disarm;
+    }
+
+    /// Feed raw ciphertext just read from the socket into `conn`'s TLS
+    /// session. While the handshake is still in progress, drives it
+    /// forward (flushing any resulting handshake ciphertext back out).
+    /// Once established, decrypts as much application-layer plaintext as
+    /// is available into `conn.read_buf` and hands it to the normal
+    /// ironwood handshake/wire-frame parser via `processBuffered`.
+    fn handleTlsReadable(self: *NetworkManager, conn: *PeerConn, tls: *TlsConn, raw: []const u8) !void {
+        try tls.feedCiphertext(raw);
+
+        if (!tls.isHandshakeDone()) {
+            const is_server = (conn.dial == null);
+            try self.pumpTlsHandshake(conn, is_server);
+            if (!tls.isHandshakeDone()) return; // still handshaking
+        }
+
+        var scratch: [READ_BUF_SIZE]u8 = undefined;
+        while (true) {
+            const outcome = tls.readPlaintext(&scratch);
+            switch (outcome) {
+                .data => |n| {
+                    if (n == 0) break;
+                    try conn.read_buf.appendSlice(self.gpa, scratch[0..n]);
+                },
+                .result => |r| switch (r) {
+                    .want_read => break, // no more plaintext available right now
+                    .closed => return error.TlsClosed,
+                    .fatal => return error.TlsFatal,
+                    else => break,
+                },
+            }
+        }
+        try self.processBuffered(conn);
     }
 
     /// Consume as many complete units (handshake message, then wire frames)
@@ -653,8 +835,39 @@ pub const NetworkManager = struct {
     // Write path (serial queue: one write in flight at a time)
     // -----------------------------------------------------------------
 
+    /// Queue `data` for writing. `data` must be plaintext -- an ironwood
+    /// handshake message or wire frame (its packet type, if decodable, is
+    /// recorded for keepalive/timeout bookkeeping). For TLS links, `data`
+    /// is encrypted via wolfSSL first and only the resulting ciphertext is
+    /// queued for the raw socket; `data` itself is freed either way.
     fn queueWriteImpl(conn: *PeerConn, data: []u8) void {
-        conn.write_queue.append(conn.manager.gpa, data) catch {
+        const packet_type: ?wire.PacketType = if (wire.decodeFrame(data)) |decoded| decoded.packet_type else |_| null;
+
+        if (conn.tls) |tls| {
+            const result = tls.writePlaintext(data);
+            conn.manager.gpa.free(data);
+            switch (result) {
+                .fatal, .closed => {
+                    conn.manager.closeConn(conn);
+                    return;
+                },
+                else => {},
+            }
+            if (tls.hasPendingCiphertext()) {
+                const bytes = tls.drainCiphertext() catch return;
+                queueRawWriteTyped(conn, bytes, packet_type);
+            }
+            return;
+        }
+
+        queueRawWriteTyped(conn, data, packet_type);
+    }
+
+    /// Queue already-final wire bytes (ciphertext, or plaintext for
+    /// non-TLS links) directly for the socket, tagged with an optional
+    /// logical packet type for keepalive bookkeeping.
+    fn queueRawWriteTyped(conn: *PeerConn, data: []u8, packet_type: ?wire.PacketType) void {
+        conn.write_queue.append(conn.manager.gpa, .{ .data = data, .packet_type = packet_type }) catch {
             conn.manager.gpa.free(data);
             return;
         };
@@ -664,7 +877,7 @@ pub const NetworkManager = struct {
     fn pumpWrite(conn: *PeerConn) void {
         if (conn.write_in_flight or conn.closing) return;
         if (conn.write_queue.items.len == 0) return;
-        const data = conn.write_queue.items[0];
+        const data = conn.write_queue.items[0].data;
         conn.write_in_flight = true;
         conn.tcp.write(conn.manager.loop, &conn.write_completion, .{ .slice = data }, PeerConn, conn, onWrite);
     }
@@ -690,8 +903,8 @@ pub const NetworkManager = struct {
                 conn.maybeDestroy();
                 return .disarm;
             };
-            conn.manager.gpa.free(conn.write_queue.items[0]);
-            conn.write_queue.items[0] = remaining_data;
+            conn.manager.gpa.free(conn.write_queue.items[0].data);
+            conn.write_queue.items[0].data = remaining_data;
             conn.write_in_flight = false;
             if (conn.closing) {
                 conn.maybeDestroy();
@@ -703,11 +916,9 @@ pub const NetworkManager = struct {
         // Full write completed: note the packet type (for keepalive/timeout
         // bookkeeping) before freeing, then pop.
         if (conn.established) {
-            if (wire.decodeFrame(full)) |decoded| {
-                onFrameSent(conn, decoded.packet_type);
-            } else |_| {}
+            if (conn.write_queue.items[0].packet_type) |ptype| onFrameSent(conn, ptype);
         }
-        conn.manager.gpa.free(conn.write_queue.orderedRemove(0));
+        conn.manager.gpa.free(conn.write_queue.orderedRemove(0).data);
         conn.write_in_flight = false;
         if (conn.closing) {
             conn.maybeDestroy();
@@ -741,8 +952,16 @@ pub const NetworkManager = struct {
     }
 };
 
+/// Queue plaintext `data` (encrypted first if the link is TLS).
 fn queueWrite(conn: *PeerConn, data: []u8) void {
     NetworkManager.queueWriteImpl(conn, data);
+}
+
+/// Queue already-final bytes for the raw socket with no packet-type
+/// association (used for TLS handshake ciphertext, which isn't an
+/// ironwood wire frame at all).
+fn queueRawWrite(conn: *PeerConn, data: []u8) void {
+    NetworkManager.queueRawWriteTyped(conn, data, null);
 }
 
 /// Heuristic: does the buffer look like a frame header that simply hasn't
@@ -760,6 +979,7 @@ const ListenerState = struct {
     manager: *NetworkManager,
     tcp: xev.TCP,
     accept_completion: xev.Completion = undefined,
+    use_tls: bool = false,
 };
 
 // ---------------------------------------------------------------------------
