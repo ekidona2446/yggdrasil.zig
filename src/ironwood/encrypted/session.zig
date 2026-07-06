@@ -230,7 +230,7 @@ pub const SessionInfo = struct {
         };
     }
 
-    fn fixShared(self: *SessionInfo, recv_nonce: u64, send_nonce: u64) !void {
+    pub fn fixShared(self: *SessionInfo, recv_nonce: u64, send_nonce: u64) !void {
         self.recv_shared = try makeSharedSecret(&self.current, &self.recv_priv);
         self.send_shared = try makeSharedSecret(&self.current, &self.send_priv);
         self.next_send_shared = try makeSharedSecret(&self.next, &self.send_priv);
@@ -598,12 +598,25 @@ pub const SessionManager = struct {
                 }
             }
             if (msg_type == SESSION_TYPE_INIT) {
-                const ack_init = SessionInit.init(&session.recv_pub, &session.next_pub, session.local_key_seq);
+                const ack_init = SessionInit.init(&session.send_pub, &session.next_pub, session.local_key_seq);
                 const ack = try ack_init.encrypt(our_ed_kp, from_key, SESSION_TYPE_ACK, self.group_auth.preimage(), self.gpa);
                 try actions.append(self.gpa, .{ .send_to_inner = .{ .dest = from_key.*, .data = ack } });
             }
         } else {
             var session = try SessionInfo.init(hs.current, hs.next, hs.seq);
+            // If we already sent our own Init for this peer (buffered while
+            // waiting for a reply), reuse those same keys as our session's
+            // send/next keys instead of freshly-generated ones -- otherwise
+            // the peer never learns the keys we actually committed to, and
+            // both sides loop forever re-sending Inits (see reference
+            // ironwood's `_sessionForInit`).
+            if (self.buffers.getPtr(from_key.*)) |buf| {
+                session.send_pub = buf.init.current;
+                session.send_priv = buf.current_priv;
+                session.next_pub = buf.init.next;
+                session.next_priv = buf.next_priv;
+                try session.fixShared(0, 0);
+            }
             try session.handleUpdate(hs);
             if (self.buffers.getPtr(from_key.*)) |buf| {
                 if (buf.data) |d| {
@@ -612,10 +625,14 @@ pub const SessionManager = struct {
                     self.gpa.free(d);
                     buf.data = null;
                 }
+                if (self.buffers.fetchRemove(from_key.*)) |kv| {
+                    var b = kv.value;
+                    b.deinit(self.gpa);
+                }
             }
             try self.sessions.put(self.gpa, from_key.*, session);
             if (msg_type == SESSION_TYPE_INIT) {
-                const ack_init = SessionInit.init(&session.recv_pub, &session.next_pub, session.local_key_seq);
+                const ack_init = SessionInit.init(&session.send_pub, &session.next_pub, session.local_key_seq);
                 const ack = try ack_init.encrypt(our_ed_kp, from_key, SESSION_TYPE_ACK, self.group_auth.preimage(), self.gpa);
                 try actions.append(self.gpa, .{ .send_to_inner = .{ .dest = from_key.*, .data = ack } });
             }

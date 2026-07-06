@@ -160,8 +160,8 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("yggdrasil.zig {s}\n", .{YGGDRASIL_ZIG_VERSION});
     std.debug.print("public key: {x}\n", .{id.public_key});
-    std.debug.print("address:    {f}\n", .{addr});
-    std.debug.print("subnet:     {f}/64\n", .{subnet});
+    std.debug.print("address: {f}\n", .{addr});
+    std.debug.print("subnet: {f}/64\n", .{subnet});
 
     var iw_cfg = ironwood.Config.default();
     // Critical for interop: real Yggdrasil peers transform keys through
@@ -198,10 +198,10 @@ pub fn main(init: std.process.Init) !void {
             node.tun.assignAddress(gpa, std.mem.sliceTo(&t.name, 0), addr, @intCast(mtu)) catch |err| {
                 std.debug.print("[ygg] warning: failed to assign TUN address ({}); configure manually with `ip`\n", .{err});
             };
-            std.debug.print("status:     tun device '{s}' up\n", .{std.mem.sliceTo(&t.name, 0)});
+            std.debug.print("status: tun device '{s}' up\n", .{std.mem.sliceTo(&t.name, 0)});
         }
     } else {
-        std.debug.print("status:     tun disabled (--tun none)\n", .{});
+        std.debug.print("status: tun disabled (--tun none)\n", .{});
     }
 
     var tun_io: ?TunIo = null;
@@ -224,10 +224,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (admin_listen.len > 0) {
-        std.debug.print("status:     admin socket configured for {s} (not yet wired up)\n", .{admin_listen});
+        std.debug.print("status: admin socket configured for {s} (not yet wired up)\n", .{admin_listen});
     }
 
-    std.debug.print("status:     running (press Ctrl+C to stop)\n", .{});
+    std.debug.print("status: running (press Ctrl+C to stop)\n", .{});
 
     // -- Maintenance timer --------------------------------------------------
     var maint_timer = try xev.Timer.init();
