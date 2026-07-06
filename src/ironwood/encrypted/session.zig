@@ -12,6 +12,7 @@ const ironwood_crypto = @import("../crypto.zig");
 const Crypto = ironwood_crypto.Crypto;
 const PublicKey = ironwood_crypto.PublicKey;
 const Sig = ironwood_crypto.Sig;
+const timemod = @import("util").time;
 
 const wire = @import("../wire.zig");
 
@@ -55,7 +56,7 @@ pub const SessionInit = struct {
     seq: u64,
 
     pub fn init(current: *const CurvePublicKey, next: *const CurvePublicKey, key_seq: u64) SessionInit {
-        return .{ .current = current.*, .next = next.*, .key_seq = key_seq, .seq = wallClockSeconds() };
+        return .{ .current = current.*, .next = next.*, .key_seq = key_seq, .seq = timemod.wallClockSeconds() };
     }
 
     /// Encrypt an init/ack message. Caller owns the returned buffer.
@@ -222,9 +223,9 @@ pub const SessionInfo = struct {
             .next_send_nonce = 0,
             .next_recv_shared = try makeSharedSecret(&next, &recv.secret_key),
             .next_recv_nonce = 0,
-            .since_ns = monotonicNs(),
+            .since_ns = timemod.monotonicNanos(),
             .rotated_ns = null,
-            .last_activity_ns = monotonicNs(),
+            .last_activity_ns = timemod.monotonicNanos(),
             .rx = 0,
             .tx = 0,
         };
@@ -257,7 +258,7 @@ pub const SessionInfo = struct {
         self.next_priv = new_next.secret_key;
         self.local_key_seq += 1;
         try self.fixShared(0, self.send_nonce);
-        self.last_activity_ns = monotonicNs();
+        self.last_activity_ns = timemod.monotonicNanos();
     }
 
     pub fn doSend(self: *SessionInfo, msg: []const u8, gpa: Allocator) ![]u8 {
@@ -291,7 +292,7 @@ pub const SessionInfo = struct {
 
     pub fn sendFinalize(self: *SessionInfo, msg_len: u64) void {
         self.tx += msg_len;
-        self.last_activity_ns = monotonicNs();
+        self.last_activity_ns = timemod.monotonicNanos();
     }
 
     pub fn recvSnapshot(self: *const SessionInfo, msg: []const u8) RecvSnapshotResult {
@@ -350,7 +351,7 @@ pub const SessionInfo = struct {
     pub fn recvFinalize(self: *SessionInfo, snap: *const RecvSnapshot, inner_key: CurvePublicKey, payload_len: u64) !void {
         if (self.remote_key_seq != snap.remote_key_seq) {
             self.rx += payload_len;
-            self.last_activity_ns = monotonicNs();
+            self.last_activity_ns = timemod.monotonicNanos();
             return;
         }
         switch (snap.case) {
@@ -365,12 +366,12 @@ pub const SessionInfo = struct {
             },
         }
         self.rx += payload_len;
-        self.last_activity_ns = monotonicNs();
+        self.last_activity_ns = timemod.monotonicNanos();
     }
 
     fn maybeRatchetOnRecv(self: *SessionInfo, inner_key: CurvePublicKey, nonce: u64) !void {
         const should_rotate = if (self.rotated_ns) |t|
-            monotonicNs() - t > 60 * std.time.ns_per_s
+            timemod.monotonicNanos() - t > 60 * std.time.ns_per_s
         else
             true;
         if (should_rotate) {
@@ -386,12 +387,12 @@ pub const SessionInfo = struct {
             self.next_pub = new_next.public_key;
             self.next_priv = new_next.secret_key;
             try self.fixShared(nonce, 0);
-            self.rotated_ns = monotonicNs();
+            self.rotated_ns = timemod.monotonicNanos();
         }
     }
 
     pub fn isExpired(self: *const SessionInfo) bool {
-        return monotonicNs() - self.last_activity_ns > SESSION_TIMEOUT_NS;
+        return timemod.monotonicNanos() - self.last_activity_ns > SESSION_TIMEOUT_NS;
     }
 };
 
@@ -568,7 +569,7 @@ pub const SessionManager = struct {
                 .init = hs,
                 .current_priv = current.secret_key,
                 .next_priv = next.secret_key,
-                .created_ns = monotonicNs(),
+                .created_ns = timemod.monotonicNanos(),
             };
             try self.buffers.put(self.gpa, dest.*, buf);
             const encrypted = try hs.encrypt(our_ed_kp, dest, SESSION_TYPE_INIT, self.group_auth.preimage(), self.gpa);
@@ -690,7 +691,7 @@ pub const SessionManager = struct {
         {
             var it = self.buffers.iterator();
             while (it.next()) |entry| {
-                if (monotonicNs() - entry.value_ptr.created_ns > SESSION_TIMEOUT_NS)
+                if (timemod.monotonicNanos() - entry.value_ptr.created_ns > SESSION_TIMEOUT_NS)
                     to_remove.append(self.gpa, entry.key_ptr.*) catch {};
             }
         }
@@ -716,33 +717,6 @@ pub const SessionManager = struct {
 };
 
 pub const SessionSnapshot = struct { key: PublicKey, tx: u64, rx: u64, since_ns: u64 };
-
-// ---------------------------------------------------------------------------
-// Time helpers
-// ---------------------------------------------------------------------------
-
-fn wallClockSeconds() u64 {
-    if (@import("builtin").os.tag == .linux) {
-        var ts: std.os.linux.timespec = undefined;
-        if (std.os.linux.clock_gettime(.REALTIME, &ts) == 0 and ts.sec > 0)
-            return @intCast(ts.sec);
-    }
-    return 0;
-}
-
-fn monotonicNs() u64 {
-    if (@import("builtin").os.tag == .linux) {
-        var ts: std.os.linux.timespec = undefined;
-        if (std.os.linux.clock_gettime(.MONOTONIC, &ts) == 0)
-            return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-    }
-    // Fallback: use a simple counter
-    const static = struct {
-        var counter: u64 = 0;
-    };
-    static.counter += 1;
-    return static.counter;
-}
 
 // ---------------------------------------------------------------------------
 // Tests

@@ -57,6 +57,7 @@ pub fn build(b: *std.Build) void {
     node_mod.addImport("ironwood", ironwood);
     node_mod.addImport("xev", xev_mod);
     node_mod.addImport("async", async_mod);
+	node_mod.addImport("util", util_mod);
 
     const wolfssl = configureWolfssl(b, target, wolfssl_mode, wolfssl_prefix);
 
@@ -76,6 +77,13 @@ pub fn build(b: *std.Build) void {
     linkWolfssl(exe.root_module, wolfssl);
 
     b.installArtifact(exe);
+ 
+    if (target.result.os.tag == .windows) {
+		if (wintunDllPath(b, target)) |dll| {
+			const install_dll = b.addInstallBinFile(dll, "wintun.dll");
+			b.getInstallStep().dependOn(&install_dll.step);
+		}
+	}
 
     // ---- peer_probe tool --------------------------------------------------
     const probe = b.addExecutable(.{
@@ -88,6 +96,7 @@ pub fn build(b: *std.Build) void {
     });
     probe.root_module.addImport("ironwood", ironwood);
     probe.root_module.addImport("node", node_mod);
+	probe.root_module.addImport("util", util_mod);
     linkWolfssl(probe.root_module, wolfssl);
 
     b.installArtifact(probe);
@@ -152,6 +161,7 @@ pub fn build(b: *std.Build) void {
     node_tests.root_module.addImport("ironwood", ironwood);
     node_tests.root_module.addImport("xev", xev_mod);
     node_tests.root_module.addImport("async", async_mod);
+	node_tests.root_module.addImport("util", util_mod);
     linkWolfssl(node_tests.root_module, wolfssl);
     const run_node_tests = b.addRunArtifact(node_tests);
     test_step.dependOn(&run_node_tests.step);
@@ -237,6 +247,38 @@ fn linkWolfssl(module: *std.Build.Module, wolfssl: WolfsslPaths) void {
     // Add the archive by path instead of `-lwolfssl`, so the result is linked
     // statically even on systems that also have a shared libwolfssl installed.
     module.addObjectFile(wolfssl.static_lib);
-    module.linkSystemLibrary("m", .{});
-    module.linkSystemLibrary("pthread", .{});
+    const target = module.resolved_target orelse @panic("linkWolfssl requires a module with a resolved target");
+	if (target.result.os.tag == .windows) {
+		module.link_libc = true;
+		// wolfSSL's default build enables loading system CA certs, which on
+		// Windows goes through the Crypt32 certificate-store APIs
+		// (CertOpenSystemStoreA/CertEnumCertificatesInStore/CertCloseStore).
+		module.linkSystemLibrary("crypt32", .{});
+		module.linkSystemLibrary("ws2_32", .{});
+	} else {
+		module.linkSystemLibrary("m", .{});
+		module.linkSystemLibrary("pthread", .{});
+	}
+}
+
+/// Locate the architecture-appropriate `wintun.dll` inside the `wintun`
+/// package dependency (see build.zig.zon), fetched lazily -- only Windows
+/// builds pay for downloading it. Returns null if the dependency isn't
+/// available (e.g. offline build without the package pre-fetched) so the
+/// caller can skip installing it with a warning instead of hard-failing;
+/// the resulting binary just won't find a TUN device at runtime without a
+/// `wintun.dll` placed next to it by other means.
+fn wintunDllPath(b: *std.Build, target: std.Build.ResolvedTarget) ?std.Build.LazyPath {
+	const wintun_dep = b.lazyDependency("wintun", .{}) orelse return null;
+	const arch_dir = switch (target.result.cpu.arch) {
+		.x86_64 => "amd64",
+		.x86 => "x86",
+		.aarch64 => "arm64",
+		.arm => "arm",
+		else => {
+			std.log.warn("no prebuilt wintun.dll for target arch {s}; TUN will be unavailable at runtime", .{@tagName(target.result.cpu.arch)});
+			return null;
+		},
+	};
+	return wintun_dep.path(b.pathJoin(&.{ "bin", arch_dir, "wintun.dll" }));
 }

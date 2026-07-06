@@ -1014,7 +1014,7 @@ pub const Router = struct {
         if (std.mem.eql(u8, &dx, &sx)) {
             const self_key = self.selfKey();
             const path = try self.cachedCoords(&self_key);
-            const seq = wallClockSeconds();
+            const seq = timemod.wallClockSeconds();
 
             var candidate = OwnPathInfo{ .seq = seq, .path = try self.gpa.dupe(PeerPort, path) };
             if (!self.pathfinder.info.contentEqual(&candidate)) {
@@ -1365,18 +1365,6 @@ fn cloneNotify(gpa: Allocator, n: *const wire.PathNotify) Allocator.Error!wire.P
         .dest = n.dest,
         .info = .{ .seq = n.info.seq, .path = ipath, .sig = n.info.sig },
     };
-}
-
-/// Wall-clock seconds since the Unix epoch (used as the notify seq, like Go).
-fn wallClockSeconds() u64 {
-    const builtin = @import("builtin");
-    if (builtin.os.tag == .linux) {
-        var ts: std.os.linux.timespec = undefined;
-        const rc = std.os.linux.clock_gettime(.REALTIME, &ts);
-        const signed: isize = @bitCast(rc);
-        if (signed == 0 and ts.sec > 0) return @intCast(ts.sec);
-    }
-    return 0;
 }
 
 // ---------------------------------------------------------------------------

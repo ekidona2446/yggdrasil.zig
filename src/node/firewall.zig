@@ -259,12 +259,7 @@ fn parseIPv6(s: []const u8, out: *[16]u8) bool {
 }
 
 fn monotonicNs() u64 {
-    if (@import("builtin").os.tag == .linux) {
-        var ts: std.os.linux.timespec = undefined;
-        if (std.os.linux.clock_gettime(.MONOTONIC, &ts) == 0)
-            return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-    }
-    return 0;
+    return @import("util").time.monotonicNanos();
 }
 
 const testing = std.testing;

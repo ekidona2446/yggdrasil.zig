@@ -43,6 +43,7 @@
 //!         --logto FILE|stdout     Log destination (default: stdout)
 
 const std = @import("std");
+const builtin = @import("builtin");
 const xev = @import("xev");
 const ironwood = @import("ironwood");
 const node = @import("node");
@@ -52,6 +53,7 @@ const NetworkManager = node.network.NetworkManager;
 const TunAdapter = node.tun.TunAdapter;
 const ReadWriteCloser = node.ipv6rwc.ReadWriteCloser;
 const Config = node.config.Config;
+const is_windows = builtin.os.tag == .windows;
 
 const MAINTENANCE_INTERVAL_MS: u64 = 1000;
 const TUN_READ_BUF_SIZE: usize = 65535 + 4;
@@ -195,10 +197,11 @@ pub fn main(init: std.process.Init) !void {
             break :blk null;
         };
         if (tun_adapter) |*t| {
-            node.tun.assignAddress(gpa, std.mem.sliceTo(&t.name, 0), addr, @intCast(mtu)) catch |err| {
-                std.debug.print("[ygg] warning: failed to assign TUN address ({}); configure manually with `ip`\n", .{err});
+            node.tun.assignAddressForAdapter(t, addr, @intCast(mtu)) catch |err| {
+                std.debug.print("[ygg] warning: failed to assign TUN address ({}); configure manually\n", .{err});
             };
-            std.debug.print("status: tun device '{s}' up\n", .{std.mem.sliceTo(&t.name, 0)});
+            var name_buf = t.interfaceName();
+			std.debug.print("status: tun device '{s}' up\n", .{std.mem.sliceTo(&name_buf, 0)});
         }
     } else {
         std.debug.print("status: tun disabled (--tun none)\n", .{});
@@ -206,10 +209,11 @@ pub fn main(init: std.process.Init) !void {
 
     var tun_io: ?TunIo = null;
     if (tun_adapter) |*t| {
-        tun_io = TunIo{ .app = &app, .fd = t.fd, .file = xev.File.initFd(t.fd) };
+        tun_io = try TunIo.init(gpa, &app, &loop, t);
         app.tun = &tun_io.?;
-        tun_io.?.file.read(&loop, &tun_io.?.read_completion, .{ .slice = &tun_io.?.read_buf }, TunIo, &tun_io.?, TunIo.onRead);
+        tun_io.?.start(&loop);
     }
+	defer if (tun_io) |*t| t.deinit();
 
     // -- Peers / listeners ------------------------------------------------
     for (effective_peers.items) |peer_uri| {
@@ -379,19 +383,51 @@ const App = struct {
     }
 };
 
-/// Bridges the TUN file descriptor into the event loop: reads packets and
-/// forwards them through `ReadWriteCloser.handleOutbound` -> `NetworkManager`.
-const TunIo = struct {
+/// Bridges the TUN device into the event loop: reads packets and forwards
+/// them through `ReadWriteCloser.handleOutbound` -> `NetworkManager`.
+///
+/// Two backends, matching how each platform's `TunAdapter` exposes I/O:
+///   - Unix (Linux/macOS): the adapter is a plain pollable fd, so this
+///     drives it through `xev.File` exactly like a socket.
+///   - Windows: Wintun has no OS-level fd to poll; `TunAdapter` instead runs
+///     its own background thread pumping `WintunReceivePacket` into a
+///     queue, and wakes us via `xev.Async` each time it delivers a packet.
+const TunIo = switch (builtin.os.tag) {
+	.windows => TunIoWindows,
+	else => TunIoUnix,
+};
+
+const TunIoUnix = struct {
     app: *App,
-    fd: std.posix.fd_t,
+    adapter: *TunAdapter,
     file: xev.File,
     read_buf: [TUN_READ_BUF_SIZE]u8 = undefined,
     read_completion: xev.Completion = undefined,
-    write_buf: [TUN_READ_BUF_SIZE]u8 = undefined,
-    write_completion: xev.Completion = undefined,
-    write_busy: bool = false,
+    /// Only sets up fields; does not arm the first read. The read callback
+	/// needs a stable `*TunIoUnix` pointer, which isn't available until the
+	/// returned value is placed in its final (caller-owned) storage
+	/// location -- call `start` on that final pointer afterwards.
+	fn init(gpa: std.mem.Allocator, app: *App, loop: *xev.Loop, adapter: *TunAdapter) !TunIoUnix {
+		_ = gpa;
+		_ = loop;
+		return .{
+			.app = app,
+			.adapter = adapter,
+			.file = xev.File.initFd(adapter.native.pollHandle()),
+		};
+	}
 
-    fn onRead(ud: ?*TunIo, loop: *xev.Loop, c: *xev.Completion, file: xev.File, buf: xev.ReadBuffer, r: xev.ReadError!usize) xev.CallbackAction {
+	/// Arms the first read. Must be called with `self` at its final,
+	/// stable storage address (see `init`'s doc comment).
+	fn start(self: *TunIoUnix, loop: *xev.Loop) void {
+		self.armRead(loop);
+	}
+
+	fn armRead(self: *TunIoUnix, loop: *xev.Loop) void {
+		self.file.read(loop, &self.read_completion, .{ .slice = &self.read_buf }, TunIoUnix, self, onRead);
+	}
+
+	fn onRead(ud: ?*TunIoUnix, loop: *xev.Loop, c: *xev.Completion, file: xev.File, buf: xev.ReadBuffer, r: xev.ReadError!usize) xev.CallbackAction {
         _ = c;
         _ = file;
         const self = ud.?;
@@ -409,23 +445,85 @@ const TunIo = struct {
                 std.debug.print("[ygg] handleOutbound error: {}\n", .{err});
             }
         }
-        self.file.read(loop, &self.read_completion, .{ .slice = &self.read_buf }, TunIo, self, onRead);
+        self.armRead(loop);
         return .disarm;
     }
 
-    fn write(self: *TunIo, data: []const u8) !void {
-        if (data.len > self.write_buf.len) return error.PacketTooLarge;
+    fn write(self: *TunIoUnix, data: []const u8) !void {
         // Best-effort synchronous write via the blocking fd: TUN writes are
         // rarely a bottleneck compared to the network path, and doing this
         // synchronously avoids needing a write queue for the (uncommon)
         // case of back-to-back inbound packets outrunning a single async
         // write's completion.
-        const n = std.os.linux.write(self.fd, data.ptr, data.len);
-        const signed: isize = @bitCast(n);
-        if (signed < 0) return error.WriteFailed;
+        _ = try self.adapter.write(data);
     }
+
+	fn deinit(self: *TunIoUnix) void {
+		_ = self;
+	}
 };
 
+const TunIoWindows = struct {
+	app: *App,
+    adapter: *TunAdapter,
+    gpa: std.mem.Allocator,
+    queue: node.tun.WindowsRecvQueue,
+    wake: xev.Async,
+    wake_completion: xev.Completion = undefined,
+
+    /// Only sets up fields (including spawning the Wintun reader thread);
+    /// does not arm the wake-wait. Call `start` once `self` is at its
+    /// final, stable storage address (same reasoning as `TunIoUnix.init`).
+    fn init(gpa: std.mem.Allocator, app: *App, loop: *xev.Loop, adapter: *TunAdapter) !TunIoWindows {
+        _ = loop;
+        var self = TunIoWindows{
+            .app = app,
+            .adapter = adapter,
+            .gpa = gpa,
+            .queue = .{ .gpa = gpa },
+            .wake = try xev.Async.init(),
+        };
+        try adapter.native.startReaderThread(gpa, &self.queue, &self.wake);
+        return self;
+    }
+
+    fn start(self: *TunIoWindows, loop: *xev.Loop) void {
+        self.armWake(loop);
+    }
+
+    fn armWake(self: *TunIoWindows, loop: *xev.Loop) void {
+        self.wake.wait(loop, &self.wake_completion, TunIoWindows, self, onWake);
+    }
+
+    fn onWake(ud: ?*TunIoWindows, loop: *xev.Loop, c: *xev.Completion, r: xev.Async.WaitError!void) xev.CallbackAction {
+        _ = c;
+        const self = ud.?;
+        _ = r catch |err| {
+            std.debug.print("[ygg] tun wake error: {}\n", .{err});
+            self.armWake(loop);
+            return .disarm;
+        };
+        while (self.queue.pop()) |pkt| {
+            defer self.gpa.free(pkt.data);
+            std.debug.print("[ygg] tun read {d} bytes\n", .{pkt.len});
+            if (self.app.rwc.handleOutbound(pkt.data[0..pkt.len])) |frames| {
+                self.app.net.flushFrames(frames);
+            } else |err| {
+                std.debug.print("[ygg] handleOutbound error: {}\n", .{err});
+            }
+        }
+        self.armWake(loop);
+        return .disarm;
+    }
+
+    fn write(self: *TunIoWindows, data: []const u8) !void {
+        _ = try self.adapter.write(data);
+    }
+
+    fn deinit(self: *TunIoWindows) void {
+        self.wake.deinit();
+     }
+};
 // ---------------------------------------------------------------------------
 // CLI parsing
 // ---------------------------------------------------------------------------
@@ -509,7 +607,8 @@ fn printUsage() void {
 
 fn parseArgs(gpa: std.mem.Allocator, raw_args: std.process.Args) !Cli {
     var cli = Cli{};
-    var args = std.process.Args.Iterator.init(raw_args);
+    var args = try std.process.Args.Iterator.initAllocator(raw_args, gpa);
+	defer args.deinit();
     _ = args.next();
 
     while (args.next()) |arg| {

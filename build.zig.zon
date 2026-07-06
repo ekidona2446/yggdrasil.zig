@@ -12,6 +12,11 @@
             .url = "https://github.com/wolfSSL/wolfssl/archive/38a4143a480b642464074a42bfd6c09666556e8b.tar.gz",
             .hash = "N-V-__8AAA5Yoge4Qr6vEDwUx1zqEDlOBAndc-uMmoVFGDjO",
         },
+		.wintun = .{
+			.url = "https://www.wintun.net/builds/wintun-0.14.1.zip",
+			.hash = "N-V-__8AAF1XGAA0OBouBSFBpXwAkOznbQvDIxAqbWD0KMAU",
+			.lazy = true,
+		},
     },
     .paths = .{
         "build.zig",

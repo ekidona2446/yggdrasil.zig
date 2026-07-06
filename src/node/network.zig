@@ -39,12 +39,7 @@ pub const PEER_KEEPALIVE_DELAY_NS: u64 = 1 * std.time.ns_per_s;
 pub const PEER_TIMEOUT_NS: u64 = 4 * std.time.ns_per_s;
 
 fn monotonicNs() u64 {
-    if (@import("builtin").os.tag == .linux) {
-        var ts: std.os.linux.timespec = undefined;
-        if (std.os.linux.clock_gettime(.MONOTONIC, &ts) == 0)
-            return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-    }
-    return 0;
+    return @import("util").time.monotonicNanos();
 }
 
 /// Options parsed out of (or supplied alongside) a peer URI.
