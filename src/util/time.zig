@@ -45,13 +45,12 @@ pub const Instant = struct {
 pub fn monotonicNanos() u64 {
     return switch (native_os) {
         .windows => windowsMonotonicNanos(),
-        // `std.c.clockid_t`/`CLOCK` is only meaningfully defined for actual
-        // POSIX-ish targets; everything else falls through to the portable
-        // counter below.
-        else => if (@hasDecl(std.c, "CLOCK") and @TypeOf(std.c.CLOCK) != void and @hasDecl(std.c.CLOCK, "MONOTONIC"))
-            posixMonotonicNanos()
-        else
-            fallbackCounter(),
+        // Zig 0.16 aliases `std.c.CLOCK` to the `clockid_t` enum. Enum
+        // fields are not `@hasDecl`s (`@hasDecl(std.c.CLOCK, "MONOTONIC")`
+        // is false even though `std.c.CLOCK.MONOTONIC` is a valid value),
+        // so we dispatch on OS tag rather than reflection.
+        .linux, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .haiku, .freebsd, .illumos, .netbsd, .dragonfly, .openbsd, .serenity => posixMonotonicNanos(),
+        else => fallbackCounter(),
     };
 }
 
@@ -62,10 +61,8 @@ pub fn monotonicNanos() u64 {
 pub fn wallClockSeconds() u64 {
     return switch (native_os) {
         .windows => windowsWallClockSeconds(),
-        else => if (@hasDecl(std.c, "CLOCK") and @TypeOf(std.c.CLOCK) != void and @hasDecl(std.c.CLOCK, "REALTIME"))
-            posixWallClockSeconds()
-        else
-            0,
+        .linux, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .haiku, .freebsd, .illumos, .netbsd, .dragonfly, .openbsd, .serenity => posixWallClockSeconds(),
+        else => 0,
     };
 }
 
@@ -75,18 +72,36 @@ pub fn wallClockSeconds() u64 {
 // ---------------------------------------------------------------------------
 
 fn posixMonotonicNanos() u64 {
+    // Prefer the Linux syscall so modules that don't link libc (unit tests)
+    // still get a real clock. Other POSIX targets go through libc.
+    if (native_os == .linux) {
+        var ts: std.os.linux.timespec = undefined;
+        if (std.os.linux.clock_gettime(.MONOTONIC, &ts) == 0) {
+            const sec: u64 = @intCast(ts.sec);
+            const nsec: u64 = @intCast(ts.nsec);
+            return sec *% std.time.ns_per_s +% nsec;
+        }
+        return fallbackCounter();
+    }
+    if (!builtin.link_libc) return fallbackCounter();
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) == 0) {
         const sec: u64 = @intCast(ts.sec);
         const nsec: u64 = @intCast(ts.nsec);
-        return sec *% std.time.ns_per_s % nsec;
+        return sec *% std.time.ns_per_s +% nsec;
     }
-    // Fallback: a process-local counter that is at least monotonic. Not wall
-    // time, but sufficient for relative age/ordering when no clock is available.
     return fallbackCounter();
 }
 
 fn posixWallClockSeconds() u64 {
+    if (native_os == .linux) {
+        var ts: std.os.linux.timespec = undefined;
+        if (std.os.linux.clock_gettime(.REALTIME, &ts) == 0 and ts.sec > 0) {
+            return @intCast(ts.sec);
+        }
+        return 0;
+    }
+    if (!builtin.link_libc) return 0;
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts) == 0 and ts.sec > 0) {
         return @intCast(ts.sec);
@@ -138,7 +153,7 @@ fn windowsMonotonicNanos() u64 {
     const f: u64 = @intCast(freq);
     const secs = c / f;
     const rem = c % f;
-    return secs *% std.time.ns_per_s % (rem *% std.time.ns_per_s) / f;
+    return secs *% std.time.ns_per_s +% (rem *% std.time.ns_per_s) / f;
 }
 
 // ---------------------------------------------------------------------------
@@ -157,4 +172,20 @@ test "monotonic clock is non-decreasing" {
     try std.testing.expect(b.nanos >= a.nanos);
     // elapsed is saturating and never panics.
     _ = a.elapsedNanos();
+}
+
+test "monotonic clock returns real nanoseconds, not a unit counter" {
+    const a = monotonicNanos();
+    // A process-local incrementing counter starts at 0/1; a real monotonic
+    // clock on any supported OS is at least milliseconds since boot.
+    try std.testing.expect(a > 1_000_000);
+}
+
+test "wall clock is a unix timestamp" {
+    if (native_os == .windows or native_os == .linux or native_os == .macos or native_os == .freebsd) {
+        const s = wallClockSeconds();
+        // Later than 2020-01-01, earlier than 2100-01-01.
+        try std.testing.expect(s > 1_577_836_800);
+        try std.testing.expect(s < 4_102_444_800);
+    }
 }

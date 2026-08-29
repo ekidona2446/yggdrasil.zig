@@ -128,9 +128,9 @@ pub fn main(init: std.process.Init) !void {
 
         var total_read: usize = 0;
         while (total_read < body_len) {
-            const n = win.recv(sock, body.ptr  total_read, @intCast(body_len - total_read), 0);
+            const n = win.recv(sock, body.ptr + total_read, @intCast(body_len - total_read), 0);
             if (n <= 0) break;
-            total_read = @intCast(n);
+            total_read += @intCast(n);
         }
 
         const t2 = timemod.monotonicNanos();
@@ -196,11 +196,11 @@ fn report(gpa: std.mem.Allocator, header: *const [6]u8, body: []const u8, passwo
     const rtt_us = (t2 - t0) / 1000;
     const connect_us = (t1 - t0) / 1000;
     var full = std.ArrayListUnmanaged(u8).empty;
-    full.appendSlice(gpa, &header) catch { std.debug.print("FAIL|oom\n", .{}); return; };
-    full.appendSlice(gpa, body) catch { full.deinit(gpa); std.debug.print("FAIL|oom\n", .{}); return; };
+    defer full.deinit(gpa);
+    full.appendSlice(gpa, header) catch { std.debug.print("FAIL|oom\n", .{}); return; };
+    full.appendSlice(gpa, body) catch { std.debug.print("FAIL|oom\n", .{}); return; };
 
     const peer_meta = Metadata.decode(full.items, password, gpa) catch |e| {
-        full.deinit(gpa);
         std.debug.print("FAIL|decode|{}\n", .{e});
         return;
     };

@@ -529,6 +529,7 @@ test "generateDefault produces a usable config" {
     try testing.expect((try cfg.signingKey()) != null);
     try testing.expectEqualStrings("auto", cfg.if_name);
     try testing.expectEqual(@as(usize, 1), cfg.listen.len);
+    try testing.expectEqual(@as(usize, 0), cfg.peers.len);
     try testing.expectEqual(@as(usize, 1), cfg.multicast_interfaces.len);
     try testing.expectEqual(@as(usize, 3), cfg.firewall.open_tcp.len);
 }
@@ -540,6 +541,7 @@ test "writeToml + parseToml round-trip" {
     var owned_peers = try testing.allocator.alloc([]const u8, 2);
     owned_peers[0] = try testing.allocator.dupe(u8, "tcp://example.com:1234");
     owned_peers[1] = try testing.allocator.dupe(u8, "tls://peer.example:443?key=abcd");
+    for (original.peers) |p| testing.allocator.free(p);
     testing.allocator.free(original.peers);
     original.peers = owned_peers;
     original.firewall.enable = true;

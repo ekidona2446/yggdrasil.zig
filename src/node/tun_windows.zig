@@ -34,9 +34,12 @@ const DWORD = u32;
 const WCHAR = u16;
 
 extern "kernel32" fn LoadLibraryW(lpLibFileName: [*:0]const WCHAR) callconv(.winapi) ?HMODULE;
+extern "kernel32" fn FreeLibrary(hModule: HMODULE) callconv(.winapi) BOOL;
 extern "kernel32" fn GetProcAddress(hModule: HMODULE, lpProcName: [*:0]const u8) callconv(.winapi) ?FARPROC;
+extern "kernel32" fn GetModuleHandleW(lpModuleName: ?[*:0]const WCHAR) callconv(.winapi) ?HMODULE;
 extern "kernel32" fn GetModuleFileNameW(hModule: ?HMODULE, lpFilename: [*]WCHAR, nSize: DWORD) callconv(.winapi) DWORD;
 extern "kernel32" fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) callconv(.winapi) DWORD;
+extern "kernel32" fn WaitForMultipleObjects(nCount: DWORD, lpHandles: [*]const HANDLE, bWaitAll: BOOL, dwMilliseconds: DWORD) callconv(.winapi) DWORD;
 extern "kernel32" fn CreateEventW(lpEventAttributes: ?*anyopaque, bManualReset: BOOL, bInitialState: BOOL, lpName: ?[*:0]const WCHAR) callconv(.winapi) ?HANDLE;
 extern "kernel32" fn SetEvent(hEvent: HANDLE) callconv(.winapi) BOOL;
 extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) BOOL;
@@ -82,8 +85,8 @@ const Api = struct {
     sendPacket: SendPacketFn,
 
     fn load() !Api {
-        const dll = LoadLibraryW(std.unicode.utf8ToUtf16LeStringLiteral("wintun.dll")) orelse return error.WintunDllNotFound;
-        errdefer _ = CloseHandleModule(dll);
+        const dll = loadWintunDll() orelse return error.WintunDllNotFound;
+        errdefer _ = FreeLibrary(dll);
 
         return .{
             .dll = dll,
@@ -106,11 +109,26 @@ const Api = struct {
     }
 };
 
-// FreeLibrary isn't declared above since we intentionally keep the DLL
-// loaded for the process lifetime (matches Wintun's own recommendation).
-fn CloseHandleModule(m: HMODULE) BOOL {
-    _ = m;
-    return 1;
+/// Prefer `wintun.dll` sitting next to the executable (the location
+/// `build.zig` installs it to), then fall back to the regular DLL search.
+fn loadWintunDll() ?HMODULE {
+    var path_buf: [32768]WCHAR = undefined;
+    const exe = GetModuleHandleW(null);
+    const n = GetModuleFileNameW(exe, &path_buf, path_buf.len);
+    if (n > 0 and n < path_buf.len) {
+        var last_slash: usize = 0;
+        for (path_buf[0..n], 0..) |c, i| {
+            if (c == '\\' or c == '/') last_slash = i;
+        }
+        const name = std.unicode.utf8ToUtf16LeStringLiteral("wintun.dll");
+        var i: usize = 0;
+        while (name[i] != 0) : (i += 1) {
+            path_buf[last_slash + 1 + i] = name[i];
+        }
+        path_buf[last_slash + 1 + i] = 0;
+        if (LoadLibraryW(@ptrCast(&path_buf))) |dll| return dll;
+    }
+    return LoadLibraryW(std.unicode.utf8ToUtf16LeStringLiteral("wintun.dll"));
 }
 
 // ---------------------------------------------------------------------------
@@ -263,18 +281,9 @@ pub const NativeTun = struct {
     }
 
     fn waitForMultiple(handles: []HANDLE, timeout: DWORD) usize {
-        // WaitForMultipleObjects isn't declared above to keep the extern
-        // surface small; a tight loop over WaitForSingleObject with a short
-        // timeout is an acceptable substitute here since we only ever wait
-        // on 2 handles and don't need microsecond wakeup latency for a
-        // background packet pump.
-        _ = timeout;
-        while (true) {
-            for (handles, 0..) |h, i| {
-                const r = WaitForSingleObject(h, 50);
-                if (r == WAIT_OBJECT_0) return i;
-            }
-        }
+        const rc = WaitForMultipleObjects(@intCast(handles.len), handles.ptr, 0, timeout);
+        if (rc >= WAIT_OBJECT_0 and rc < WAIT_OBJECT_0 + handles.len) return rc - WAIT_OBJECT_0;
+        return 0;
     }
 
     pub fn deinit(self: *NativeTun) void {

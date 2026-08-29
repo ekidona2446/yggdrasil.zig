@@ -9,14 +9,22 @@
             .hash = "libxev-0.0.0-86vtcwIRFADbH4hk-EjROXxlrKIRPQdA41XiTSytYO-F",
         },
         .wolfssl = .{
-            .url = "https://github.com/wolfSSL/wolfssl/archive/38a4143a480b642464074a42bfd6c09666556e8b.tar.gz",
+            .url = "https://github.com/wolfSSL/wolfssl/archive/refs/heads/master.tar.gz",
             .hash = "N-V-__8AAA5Yoge4Qr6vEDwUx1zqEDlOBAndc-uMmoVFGDjO",
         },
-		.wintun = .{
-			.url = "https://www.wintun.net/builds/wintun-0.14.1.zip",
-			.hash = "N-V-__8AAF1XGAA0OBouBSFBpXwAkOznbQvDIxAqbWD0KMAU",
-			.lazy = true,
-		},
+        .wintun = .{
+            .url = "https://www.wintun.net/builds/wintun-0.14.1.zip",
+            .hash = "N-V-__8AAF1XGAA0OBouBSFBpXwAkOznbQvDIxAqbWD0KMAU",
+            .lazy = true,
+        },
+        .zquic = .{
+            .url = "https://github.com/ch4r10t33r/zquic/archive/refs/tags/v1.7.86.tar.gz",
+            .hash = "zquic-1.7.0-2zRc1PSAFgDCESpm-vZsUr4O02HM0dpzmVJSx5WXW6ES",
+        },
+        .libwebsockets = .{
+            .url = "https://github.com/warmcat/libwebsockets/archive/refs/heads/main.tar.gz",
+            .hash = "N-V-__8AANCNnQG1-ZiD9q4ApmNoxygK9zFRj4WcocglAEam",
+        },
     },
     .paths = .{
         "build.zig",

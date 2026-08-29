@@ -49,18 +49,9 @@ pub const Address = struct {
         return key;
     }
 
-    /// Format as IPv6 address string (e.g. "200:abcd::1").
+    /// Format as an RFC 5952 IPv6 address (no leading zeros, `::` compression).
     pub fn format(self: Address, writer: anytype) !void {
-        // Manual IPv6 formatting: 8 groups of 2 bytes in hex
-        var started: bool = false;
-        const delim = ":";
-        for (0..8) |i| {
-            const hi = self.bytes[i * 2];
-            const lo = self.bytes[i * 2 + 1];
-            if (started) try writer.writeAll(delim);
-            try writer.print("{x:0>2}{x:0>2}", .{ hi, lo });
-            started = true;
-        }
+        try formatIpv6(&self.bytes, writer);
     }
 };
 
@@ -76,16 +67,12 @@ pub const Subnet = struct {
         return self.bytes[0] == SUBNET_PREFIX;
     }
 
-    /// Format as IPv6 subnet prefix string (e.g. "300:abcd:0:0").
+    /// Format as an RFC 5952 IPv6 prefix (the /64 host bits are zero, so
+    /// this typically ends with `::`).
     pub fn format(self: Subnet, writer: anytype) !void {
-        var started: bool = false;
-        for (0..4) |i| {
-            const hi = self.bytes[i * 2];
-            const lo = self.bytes[i * 2 + 1];
-            if (started) try writer.writeAll(":");
-            try writer.print("{x:0>2}{x:0>2}", .{ hi, lo });
-            started = true;
-        }
+        var full: [16]u8 = [_]u8{0} ** 16;
+        @memcpy(full[0..8], &self.bytes);
+        try formatIpv6(&full, writer);
     }
 
     /// Reconstruct a partial ed25519 public key from this subnet.
@@ -173,9 +160,80 @@ pub fn bloomKeyTransform(key: [32]u8) [32]u8 {
     return subnet.getKey();
 }
 
+/// RFC 5952 §4: lowercase hex, drop leading zeros in each hextet, compress
+/// the longest run of two-or-more zero hextets to `::` (leftmost on a tie).
+pub fn formatIpv6(bytes: *const [16]u8, writer: anytype) !void {
+    const parts: [8]u16 = .{
+        std.mem.readInt(u16, bytes[0..2], .big),
+        std.mem.readInt(u16, bytes[2..4], .big),
+        std.mem.readInt(u16, bytes[4..6], .big),
+        std.mem.readInt(u16, bytes[6..8], .big),
+        std.mem.readInt(u16, bytes[8..10], .big),
+        std.mem.readInt(u16, bytes[10..12], .big),
+        std.mem.readInt(u16, bytes[12..14], .big),
+        std.mem.readInt(u16, bytes[14..16], .big),
+    };
+
+    var longest_start: usize = 8;
+    var longest_len: usize = 0;
+    var current_start: usize = 0;
+    var current_len: usize = 0;
+    for (parts, 0..) |part, i| {
+        if (part == 0) {
+            if (current_len == 0) current_start = i;
+            current_len += 1;
+            if (current_len > longest_len) {
+                longest_start = current_start;
+                longest_len = current_len;
+            }
+        } else {
+            current_len = 0;
+        }
+    }
+    if (longest_len < 2) {
+        longest_start = 8;
+        longest_len = 0;
+    }
+
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        if (i == longest_start) {
+            try writer.writeAll(if (i == 0) "::" else ":");
+            i += longest_len - 1;
+            continue;
+        }
+        try writer.print("{x}", .{parts[i]});
+        if (i != 7) try writer.writeAll(":");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+test "rfc5952 omits leading zeros" {
+    const addr = Address{ .bytes = .{ 0x02, 0x00, 0xe4, 0xf3, 0xa2, 0x3f, 0xa0, 0xeb, 0x3f, 0xf4, 0x35, 0x90, 0xfc, 0xa0, 0x3f, 0x9b } };
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try addr.format(&w);
+    try testing.expectEqualStrings("200:e4f3:a23f:a0eb:3ff4:3590:fca0:3f9b", w.buffered());
+}
+
+test "rfc5952 compresses longest zero run" {
+    const addr = Address{ .bytes = .{ 0x02, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 } };
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try addr.format(&w);
+    try testing.expectEqualStrings("200::1", w.buffered());
+}
+
+test "rfc5952 subnet drops trailing zeros" {
+    const subnet = Subnet{ .bytes = .{ 0x03, 0x00, 0xe4, 0xf3, 0xa2, 0x3f, 0xa0, 0xeb } };
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try subnet.format(&w);
+    try testing.expectEqualStrings("300:e4f3:a23f:a0eb::", w.buffered());
+}
 
 test "zero key address" {
     const key = [_]u8{0} ** 32;

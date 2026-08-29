@@ -88,16 +88,13 @@ pub fn assignAddressForAdapter(adapter: *TunAdapter, addr: node.Address, mtu: u1
 
 fn formatAddress(buf: []u8, bytes: *const [16]u8) ![]const u8 {
     var w: std.Io.Writer = .fixed(buf);
-    for (0..8) |i| {
-        if (i > 0) try w.writeAll(":");
-        try w.print("{x}", .{std.mem.readInt(u16, bytes[i * 2 ..][0..2], .big)});
-    }
+    try node.address.formatIpv6(bytes, &w);
     return w.buffered();
 }
 
-test "formatAddress produces colon-separated hex groups" {
+test "formatAddress uses RFC 5952" {
     const bytes: [16]u8 = .{ 0x02, 0x01, 0xab, 0xcd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
     var buf: [64]u8 = undefined;
     const s = try formatAddress(&buf, &bytes);
-    try std.testing.expectEqualStrings("201:abcd:0:0:0:0:0:1", s);
+    try std.testing.expectEqualStrings("201:abcd::1", s);
 }

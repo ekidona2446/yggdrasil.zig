@@ -11,6 +11,8 @@ const ironwood = @import("ironwood");
 const node = @import("node.zig");
 const dns = @import("dns.zig");
 const tls_wolfssl = @import("tls_wolfssl.zig");
+const ws = @import("ws.zig");
+const quic_mod = @import("quic.zig");
 
 const Core = node.core.Core;
 const Metadata = node.version.Metadata;
@@ -54,6 +56,14 @@ pub const LinkOptions = struct {
     /// Optional TLS SNI hostname override (client-side only). Falls back to
     /// the dialed hostname when null and `use_tls` is set.
     tls_sni: ?[]const u8 = null,
+    /// Wrap the byte stream in RFC 6455 WebSocket frames (`ws://` / `wss://`).
+    use_ws: bool = false,
+    /// QUIC/UDP instead of TCP (`quic://`).
+    use_quic: bool = false,
+    /// HTTP path for the WebSocket upgrade (default `/`).
+    ws_path: []const u8 = "/",
+    /// Host header / SNI name for WebSocket/TLS (not necessarily an IP).
+    ws_host: []const u8 = "",
 };
 
 fn logInfo(comptime fmt: []const u8, args: anytype) void {
@@ -75,6 +85,7 @@ pub const ParsedURI = struct {
     scheme: []const u8,
     host: []const u8,
     port: u16,
+    path: []const u8,
 };
 
 pub fn parsePeerURI(uri: []const u8) !ParsedURI {
@@ -83,10 +94,18 @@ pub fn parsePeerURI(uri: []const u8) !ParsedURI {
     const rest = uri[scheme_end + 3 ..];
     const addr_part = if (std.mem.indexOfScalar(u8, rest, '?')) |qpos| rest[0..qpos] else rest;
     const hp = try extractHostPort(addr_part);
-    return .{ .scheme = scheme, .host = hp.host, .port = hp.port };
+    return .{ .scheme = scheme, .host = hp.host, .port = hp.port, .path = hp.path };
 }
 
-const HostPort = struct { host: []const u8, port: u16 };
+const HostPort = struct { host: []const u8, port: u16, path: []const u8 };
+
+fn stripPath(hostport: []const u8) struct { hp: []const u8, path: []const u8 } {
+    if (std.mem.indexOfScalar(u8, hostport, '/')) |s| {
+        const path = hostport[s..];
+        return .{ .hp = hostport[0..s], .path = if (path.len == 0) "/" else path };
+    }
+    return .{ .hp = hostport, .path = "/" };
+}
 
 fn extractHostPort(addr_part: []const u8) !HostPort {
     if (addr_part.len == 0) return error.InvalidURI;
@@ -94,12 +113,12 @@ fn extractHostPort(addr_part: []const u8) !HostPort {
         const closing = std.mem.indexOfScalar(u8, addr_part, ']') orelse return error.InvalidURI;
         const after_bracket = addr_part[closing + 1 ..];
         if (after_bracket.len == 0 or after_bracket[0] != ':') return error.InvalidURI;
-        const port_str = after_bracket[1..];
-        return .{ .host = addr_part[1..closing], .port = try std.fmt.parseInt(u16, port_str, 10) };
+        const split = stripPath(after_bracket[1..]);
+        return .{ .host = addr_part[1..closing], .port = try std.fmt.parseInt(u16, split.hp, 10), .path = split.path };
     } else {
         const colon = std.mem.lastIndexOfScalar(u8, addr_part, ':') orelse return error.InvalidURI;
-        const port_str = addr_part[colon + 1 ..];
-        return .{ .host = addr_part[0..colon], .port = try std.fmt.parseInt(u16, port_str, 10) };
+        const split = stripPath(addr_part[colon + 1 ..]);
+        return .{ .host = addr_part[0..colon], .port = try std.fmt.parseInt(u16, split.hp, 10), .path = split.path };
     }
 }
 
@@ -135,6 +154,14 @@ const PeerConn = struct {
     use_tls: bool = false,
     tls: ?*TlsConn = null,
     tls_handshake_done: bool = false,
+    use_ws: bool = false,
+    ws_handshake_done: bool = false,
+    ws_key_b64: [24]u8 = undefined,
+    ws_accept_b64: [28]u8 = undefined,
+    /// Raw HTTP/WebSocket bytes. After the RFC 6455 upgrade, incoming TCP/TLS
+    /// bytes go here and are decoded into `read_buf` (ironwood plaintext).
+    /// Mixing the two in one buffer is what dropped live `ws://` peers.
+    ws_raw: std.ArrayListUnmanaged(u8) = .empty,
     /// Priority/password to use for the *ironwood* Metadata handshake, sent
     /// once the TLS handshake finishes (for plain TCP links this is used
     /// immediately in `spawnConn` instead). Slices here are assumed to
@@ -192,6 +219,9 @@ const PeerConn = struct {
 
     // Outbound-only reconnect state (null for inbound connections).
     dial: ?*DialState = null,
+    /// QUIC session (null for TCP/TLS/WS). When set, socket I/O goes through
+    /// zquic instead of `tcp`.
+    quic: ?*QuicLink = null,
 
     /// Destroy `self` iff we're closing and no slot has an outstanding
     /// completion anymore. Safe to call redundantly from multiple callback
@@ -208,10 +238,17 @@ const PeerConn = struct {
     fn destroy(self: *PeerConn) void {
         const gpa = self.manager.gpa;
         self.read_buf.deinit(gpa);
+        self.ws_raw.deinit(gpa);
         for (self.write_queue.items) |w| gpa.free(w.data);
         self.write_queue.deinit(gpa);
         self.keepalive_timer.deinit();
         if (self.tls) |t| t.deinit();
+        if (self.quic) |link| {
+            link.tick.deinit();
+            quic_mod.destroyClient(gpa, link.client);
+            gpa.free(link.host);
+            gpa.destroy(link);
+        }
         gpa.destroy(self);
     }
 };
@@ -227,6 +264,28 @@ const DialState = struct {
     timer_completion: xev.Completion = undefined,
     connect_completion: xev.Completion = undefined,
     tcp: xev.TCP = undefined,
+};
+
+/// One outbound `quic://` peer. zquic owns the UDP socket; we poll it with
+/// libxev and pump STREAM bytes into the same ironwood handshake/frame path
+/// used by TCP.
+const QuicLink = struct {
+    manager: *NetworkManager,
+    conn: *PeerConn,
+    client: *quic_mod.io.Client,
+    host: []u8,
+    options: LinkOptions,
+    stream_id: u64 = 0,
+    send_off: u64 = 0,
+    recv_off: usize = 0,
+    stream_opened: bool = false,
+    udp: xev.UDP,
+    udp_c: xev.Completion = undefined,
+    udp_st: xev.UDP.State = undefined,
+    recv_scratch: [2048]u8 = undefined,
+    tick: xev.Timer,
+    tick_c: xev.Completion = undefined,
+    closing: bool = false,
 };
 
 // ---------------------------------------------------------------------------
@@ -372,7 +431,19 @@ pub const NetworkManager = struct {
         errdefer self.gpa.free(host_dup);
 
         var options = options_in;
-        options.use_tls = std.mem.eql(u8, parsed.scheme, "tls");
+        options.use_tls = std.mem.eql(u8, parsed.scheme, "tls") or std.mem.eql(u8, parsed.scheme, "wss");
+        options.use_ws = std.mem.eql(u8, parsed.scheme, "ws") or std.mem.eql(u8, parsed.scheme, "wss");
+        options.use_quic = std.mem.eql(u8, parsed.scheme, "quic");
+        options.ws_path = parsed.path;
+        options.ws_host = parsed.host;
+
+        if (options.use_quic) {
+            self.startQuicDial(host_dup, parsed.port, options) catch |err| {
+                logInfo("quic://{s}:{d} setup failed: {}", .{ parsed.host, parsed.port, err });
+                self.gpa.free(host_dup);
+            };
+            return;
+        }
 
         const dial = try self.gpa.create(DialState);
         dial.* = .{
@@ -496,8 +567,13 @@ pub const NetworkManager = struct {
             .dial = dial,
             .keepalive_timer = try xev.Timer.init(),
             .use_tls = options.use_tls,
+            .use_ws = options.use_ws,
             .pending_options = options,
         };
+        if (options.use_ws) {
+            ws.generateKey(&conn.ws_key_b64);
+            ws.acceptKey(&conn.ws_key_b64, &conn.ws_accept_b64);
+        }
         self.conns.append(&conn.list_node);
 
         if (options.use_tls) {
@@ -511,6 +587,8 @@ pub const NetworkManager = struct {
             // sent only once the TLS handshake itself completes (see
             // `pumpTlsHandshake`).
             try self.pumpTlsHandshake(conn, is_server);
+        } else if (options.use_ws) {
+            try self.sendWsUpgrade(conn);
         } else {
             // Plain TCP: send our ironwood handshake metadata immediately;
             // queueWrite handles the async write via the same path used
@@ -547,9 +625,13 @@ pub const NetworkManager = struct {
             .ok => {
                 if (tls.isHandshakeDone() and !conn.tls_handshake_done) {
                     conn.tls_handshake_done = true;
-                    const meta = Metadata.init(self.our_id.public_key, conn.pending_options.priority);
-                    const msg = try meta.encode(&self.our_id, conn.pending_options.password, self.gpa);
-                    queueWrite(conn, msg); // encrypted via conn.tls automatically
+                    if (conn.use_ws) {
+                        try self.sendWsUpgrade(conn);
+                    } else {
+                        const meta = Metadata.init(self.our_id.public_key, conn.pending_options.priority);
+                        const msg = try meta.encode(&self.our_id, conn.pending_options.password, self.gpa);
+                        queueWrite(conn, msg);
+                    }
                 }
             },
         }
@@ -632,6 +714,12 @@ pub const NetworkManager = struct {
             logInfo("peer disconnected: {x}", .{conn.peer_key});
         }
         self.conns.remove(&conn.list_node);
+        if (conn.quic) |link| {
+            link.closing = true;
+            conn.close_active = false;
+            conn.maybeDestroy();
+            return;
+        }
         conn.close_active = true;
         conn.tcp.close(self.loop, &conn.close_completion, PeerConn, conn, onClose);
         // Cancel the keepalive timer so it doesn't keep firing (and holding
@@ -687,12 +775,21 @@ pub const NetworkManager = struct {
                 return .disarm;
             };
         } else {
-            conn.read_buf.appendSlice(conn.manager.gpa, raw) catch {
-                conn.read_active = false;
-                conn.manager.closeConn(conn);
-                conn.maybeDestroy();
-                return .disarm;
-            };
+            if (conn.use_ws) {
+                conn.ws_raw.appendSlice(conn.manager.gpa, raw) catch {
+                    conn.read_active = false;
+                    conn.manager.closeConn(conn);
+                    conn.maybeDestroy();
+                    return .disarm;
+                };
+            } else {
+                conn.read_buf.appendSlice(conn.manager.gpa, raw) catch {
+                    conn.read_active = false;
+                    conn.manager.closeConn(conn);
+                    conn.maybeDestroy();
+                    return .disarm;
+                };
+            }
             conn.manager.processBuffered(conn) catch |err| {
                 logInfo("frame processing error, dropping peer: {}", .{err});
                 conn.read_active = false;
@@ -733,7 +830,11 @@ pub const NetworkManager = struct {
             switch (outcome) {
                 .data => |n| {
                     if (n == 0) break;
-                    try conn.read_buf.appendSlice(self.gpa, scratch[0..n]);
+                    if (conn.use_ws) {
+                        try conn.ws_raw.appendSlice(self.gpa, scratch[0..n]);
+                    } else {
+                        try conn.read_buf.appendSlice(self.gpa, scratch[0..n]);
+                    }
                 },
                 .result => |r| switch (r) {
                     .want_read => break, // no more plaintext available right now
@@ -746,9 +847,189 @@ pub const NetworkManager = struct {
         try self.processBuffered(conn);
     }
 
+    fn sendWsUpgrade(self: *NetworkManager, conn: *PeerConn) !void {
+        const host = if (conn.pending_options.ws_host.len > 0) conn.pending_options.ws_host else "localhost";
+        const port: u16 = if (conn.dial) |d| d.port else 80;
+        const path = if (conn.pending_options.ws_path.len > 0) conn.pending_options.ws_path else "/";
+        const msg = try ws.buildClientUpgrade(self.gpa, host, port, path, &conn.ws_key_b64);
+        queueWrite(conn, msg);
+        logInfo("websocket upgrade sent to {s}:{d}{s}", .{ host, port, path });
+    }
+
+    fn startQuicDial(self: *NetworkManager, host: []u8, port: u16, options: LinkOptions) !void {
+        const addrs = dns.resolve(self.gpa, host, port) catch |err| {
+            logInfo("quic resolve {s}:{d} failed: {}", .{ host, port, err });
+            return err;
+        };
+        defer self.gpa.free(addrs);
+        var ip4: ?[4]u8 = null;
+        var use_port: u16 = port;
+        for (addrs) |a| {
+            switch (a) {
+                .ip4 => |v| {
+                    ip4 = v.bytes;
+                    use_port = v.port;
+                    break;
+                },
+                else => {},
+            }
+        }
+        const octets = ip4 orelse return error.NoAddresses;
+
+        const client = try quic_mod.createClient(self.gpa, host, use_port);
+        errdefer quic_mod.destroyClient(self.gpa, client);
+        quic_mod.setPeerIpv4(client, octets, use_port);
+        try quic_mod.startHandshake(client);
+        logInfo("quic://{s}:{d} Initial sent to {d}.{d}.{d}.{d} ({d} bytes on wire)", .{
+            host, use_port, octets[0], octets[1], octets[2], octets[3], client.conn.init_pn,
+        });
+
+        const conn = try self.gpa.create(PeerConn);
+        errdefer self.gpa.destroy(conn);
+        conn.* = .{
+            .manager = self,
+            .tcp = undefined,
+            .keepalive_timer = try xev.Timer.init(),
+            .pending_options = options,
+        };
+
+        const link = try self.gpa.create(QuicLink);
+        errdefer self.gpa.destroy(link);
+        link.* = .{
+            .manager = self,
+            .conn = conn,
+            .client = client,
+            .host = host,
+            .options = options,
+            .udp = xev.UDP.initFd(client.sock),
+            .tick = try xev.Timer.init(),
+        };
+        conn.quic = link;
+        self.conns.append(&conn.list_node);
+
+        conn.keepalive_active = true;
+        conn.keepalive_timer.run(self.loop, &conn.keepalive_completion, KEEPALIVE_TICK_MS, PeerConn, conn, onKeepaliveTick);
+
+        link.tick.run(self.loop, &link.tick_c, 20, QuicLink, link, onQuicTick);
+    }
+
+    fn drainQuicUdp(_: *NetworkManager, link: *QuicLink) void {
+        while (true) {
+            const rc = std.os.linux.recvfrom(
+                link.client.sock,
+                &link.recv_scratch,
+                link.recv_scratch.len,
+                std.os.linux.MSG.DONTWAIT,
+                null,
+                null,
+            );
+            const n: isize = @bitCast(rc);
+            if (n <= 0) break;
+            link.client.feedPacket(link.recv_scratch[0..@intCast(n)]);
+        }
+    }
+
+    fn onQuicTick(ud: ?*QuicLink, loop: *xev.Loop, c: *xev.Completion, r: xev.Timer.RunError!void) xev.CallbackAction {
+        _ = r catch {};
+        const link = ud.?;
+        if (link.closing) return .disarm;
+        link.manager.drainQuicUdp(link);
+        link.manager.pumpQuic(link);
+        if (link.closing) return .disarm;
+        link.tick.run(loop, c, 20, QuicLink, link, onQuicTick);
+        return .disarm;
+    }
+
+    fn pumpQuic(self: *NetworkManager, link: *QuicLink) void {
+        if (link.closing) return;
+        link.client.processPendingWork(link.client.conn.peer);
+        link.client.flushDeferredAck();
+
+        if (!link.stream_opened and quic_mod.isConnected(link.client)) {
+            const sid = link.client.tryOpenLocalBidiStream() catch |err| {
+                logInfo("quic://{s} open stream failed: {}", .{ link.host, err });
+                return;
+            };
+            link.stream_id = sid;
+            link.stream_opened = true;
+            logInfo("quic://{s} handshake complete, stream {d}", .{ link.host, sid });
+            const meta = Metadata.init(self.our_id.public_key, link.options.priority);
+            const msg = meta.encode(&self.our_id, link.options.password, self.gpa) catch return;
+            queueWrite(link.conn, msg);
+        }
+
+        if (link.stream_opened) {
+            if (link.client.rawAppRecvBuffer(link.stream_id)) |got| {
+                if (got.len > link.recv_off) {
+                    const fresh = got[link.recv_off..];
+                    link.conn.read_buf.appendSlice(self.gpa, fresh) catch return;
+                    link.recv_off = got.len;
+                    self.processBuffered(link.conn) catch |err| {
+                        logInfo("quic frame error {s}: {}", .{ link.host, err });
+                        self.closeQuic(link);
+                        return;
+                    };
+                }
+            }
+        }
+    }
+
+    fn closeQuic(self: *NetworkManager, link: *QuicLink) void {
+        if (link.closing) return;
+        link.closing = true;
+        self.closeConn(link.conn);
+    }
+
+    fn unwrapWs(self: *NetworkManager, conn: *PeerConn) !void {
+        if (!conn.use_ws) return;
+        if (!conn.ws_handshake_done) {
+            const parsed = ws.parseServerUpgrade(conn.ws_raw.items, &conn.ws_accept_b64) orelse return;
+            if (!parsed.ok) return error.BadWsUpgrade;
+            const remaining = conn.ws_raw.items[parsed.consumed..];
+            std.mem.copyForwards(u8, conn.ws_raw.items[0..remaining.len], remaining);
+            conn.ws_raw.shrinkRetainingCapacity(remaining.len);
+            conn.ws_handshake_done = true;
+            logInfo("websocket upgrade complete", .{});
+            const meta = Metadata.init(self.our_id.public_key, conn.pending_options.priority);
+            const msg = try meta.encode(&self.our_id, conn.pending_options.password, self.gpa);
+            queueWrite(conn, msg);
+        }
+
+        var src = conn.ws_raw.items;
+        var read_pos: usize = 0;
+        while (read_pos < src.len) {
+            const slice = src[read_pos..];
+            const decoded = ws.decodeFrame(slice) catch |err| switch (err) {
+                error.Incomplete => break,
+                error.Close => return error.TlsClosed,
+                else => return err,
+            };
+            switch (decoded.frame.opcode) {
+                .binary, .text, .continuation => {
+                    try conn.read_buf.appendSlice(self.gpa, decoded.frame.payload);
+                },
+                .ping => {
+                    const pong = ws.encodeFrame(self.gpa, .pong, decoded.frame.payload) catch break;
+                    const prev = conn.use_ws;
+                    conn.use_ws = false;
+                    queueWrite(conn, pong);
+                    conn.use_ws = prev;
+                },
+                .pong => {},
+                .close => return error.TlsClosed,
+            }
+            read_pos += decoded.consumed;
+        }
+        const leftover = src[read_pos..];
+        std.mem.copyForwards(u8, conn.ws_raw.items[0..leftover.len], leftover);
+        conn.ws_raw.shrinkRetainingCapacity(leftover.len);
+    }
+
     /// Consume as many complete units (handshake message, then wire frames)
     /// as are available in `conn.read_buf`.
     fn processBuffered(self: *NetworkManager, conn: *PeerConn) !void {
+        try self.unwrapWs(conn);
+        if (conn.use_ws and !conn.ws_handshake_done) return;
         if (!conn.established) {
             if (try self.tryParseHandshake(conn)) |consumed| {
                 const remaining = conn.read_buf.items[consumed..];
@@ -836,11 +1117,31 @@ pub const NetworkManager = struct {
     /// is encrypted via wolfSSL first and only the resulting ciphertext is
     /// queued for the raw socket; `data` itself is freed either way.
     fn queueWriteImpl(conn: *PeerConn, data: []u8) void {
-        const packet_type: ?wire.PacketType = if (wire.decodeFrame(data)) |decoded| decoded.packet_type else |_| null;
+        var payload = data;
+        const packet_type: ?wire.PacketType = if (wire.decodeFrame(payload)) |decoded| decoded.packet_type else |_| null;
+        if (conn.use_ws and conn.ws_handshake_done) {
+            const framed = ws.encodeFrame(conn.manager.gpa, .binary, payload) catch {
+                conn.manager.gpa.free(payload);
+                return;
+            };
+            conn.manager.gpa.free(payload);
+            payload = framed;
+        }
+
+        if (conn.quic) |link| {
+            if (!link.stream_opened) {
+                conn.manager.gpa.free(payload);
+                return;
+            }
+            const n = link.client.sendRawStreamData(link.stream_id, link.send_off, payload, false);
+            if (n > 0) link.send_off += n;
+            conn.manager.gpa.free(payload);
+            return;
+        }
 
         if (conn.tls) |tls| {
-            const result = tls.writePlaintext(data);
-            conn.manager.gpa.free(data);
+            const result = tls.writePlaintext(payload);
+            conn.manager.gpa.free(payload);
             switch (result) {
                 .fatal, .closed => {
                     conn.manager.closeConn(conn);
@@ -855,7 +1156,7 @@ pub const NetworkManager = struct {
             return;
         }
 
-        queueRawWriteTyped(conn, data, packet_type);
+        queueRawWriteTyped(conn, payload, packet_type);
     }
 
     /// Queue already-final wire bytes (ciphertext, or plaintext for
@@ -1001,6 +1302,21 @@ test "parse peer uri with query string" {
     const parsed = try parsePeerURI("tcp://1.2.3.4:1337?key=abcd");
     try testing.expectEqualStrings("1.2.3.4", parsed.host);
     try testing.expectEqual(@as(u16, 1337), parsed.port);
+}
+
+test "parse websocket uri with path" {
+    const parsed = try parsePeerURI("ws://example.com:1340/ygg");
+    try testing.expectEqualStrings("ws", parsed.scheme);
+    try testing.expectEqualStrings("example.com", parsed.host);
+    try testing.expectEqual(@as(u16, 1340), parsed.port);
+    try testing.expectEqualStrings("/ygg", parsed.path);
+}
+
+test "parse quic uri" {
+    const parsed = try parsePeerURI("quic://ygg-msk-1.averyan.ru:8364");
+    try testing.expectEqualStrings("quic", parsed.scheme);
+    try testing.expectEqual(@as(u16, 8364), parsed.port);
+    try testing.expectEqualStrings("/", parsed.path);
 }
 
 test "isIncompleteFrame detects short buffers" {

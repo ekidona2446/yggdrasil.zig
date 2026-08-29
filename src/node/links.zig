@@ -45,10 +45,10 @@ pub const LinkOptions = struct {
 // Peer URI parsing
 // ---------------------------------------------------------------------------
 
-/// Parse a peer URI like "tcp://host:port" or "tls://host:port" into
-/// a scheme, host, and port.
-pub fn parsePeerURI(uri: []const u8) !struct { scheme: []const u8, host: []const u8, port: u16, options: LinkOptions } {
-    // Format: scheme://[host]:port?key=val...
+/// Parse a peer URI like "tcp://host:port", "ws://host:port/path", or
+/// "quic://host:port" into a scheme, host, port, and HTTP path.
+pub fn parsePeerURI(uri: []const u8) !struct { scheme: []const u8, host: []const u8, port: u16, path: []const u8, options: LinkOptions } {
+    // Format: scheme://[host]:port[/path]?key=val...
     const scheme_end = std.mem.indexOf(u8, uri, "://") orelse return error.InvalidURI;
     const scheme = uri[0..scheme_end];
     const rest = uri[scheme_end + 3 ..];
@@ -62,6 +62,7 @@ pub fn parsePeerURI(uri: []const u8) !struct { scheme: []const u8, host: []const
         .scheme = scheme,
         .host = hp.host,
         .port = hp.port,
+        .path = hp.path,
         .options = LinkOptions{},
     };
 }
@@ -156,18 +157,26 @@ test "handshake success" {
 }
 
 
+fn stripPath(hostport: []const u8) struct { hp: []const u8, path: []const u8 } {
+    if (std.mem.indexOfScalar(u8, hostport, '/')) |s| {
+        const path = hostport[s..];
+        return .{ .hp = hostport[0..s], .path = if (path.len == 0) "/" else path };
+    }
+    return .{ .hp = hostport, .path = "/" };
+}
+
 fn extractHostPort(addr_part: []const u8) !HostPort {
     if (addr_part[0] == '[') {
         const closing = std.mem.indexOfScalar(u8, addr_part, ']') orelse return error.InvalidURI;
         const after_bracket = addr_part[closing + 1 ..];
         if (after_bracket.len == 0 or after_bracket[0] != ':') return error.InvalidURI;
-        const port_str = after_bracket[1..];
-        return HostPort{ .host = addr_part[1..closing], .port = try std.fmt.parseInt(u16, port_str, 10) };
+        const split = stripPath(after_bracket[1..]);
+        return HostPort{ .host = addr_part[1..closing], .port = try std.fmt.parseInt(u16, split.hp, 10), .path = split.path };
     } else {
         const colon = std.mem.lastIndexOfScalar(u8, addr_part, ':') orelse return error.InvalidURI;
-        const port_str = addr_part[colon + 1 ..];
-        return HostPort{ .host = addr_part[0..colon], .port = try std.fmt.parseInt(u16, port_str, 10) };
+        const split = stripPath(addr_part[colon + 1 ..]);
+        return HostPort{ .host = addr_part[0..colon], .port = try std.fmt.parseInt(u16, split.hp, 10), .path = split.path };
     }
 }
 
-const HostPort = struct { host: []const u8, port: u16 };
+const HostPort = struct { host: []const u8, port: u16, path: []const u8 };

@@ -599,8 +599,9 @@ fn printUsage() void {
         \\      --loglevel LEVEL     error|warn|info|debug (default: info)
         \\      --logto FILE|stdout  Log destination (default: stdout)
         \\
-        \\Peer URI schemes: tcp://host:port, tls://host:port (real TLS 1.3
-        \\via wolfSSL). Query params: ?key=HEX&password=PW&priority=N.
+        \\Peer URI schemes: tcp://host:port, tls://host:port,
+		\\ ws://host:port[/path], wss://host:port[/path],
+		\\ quic://host:port. Query: ?key=HEX&password=PW&priority=N.
         \\
     , .{});
 }

@@ -59,7 +59,15 @@ pub fn build(b: *std.Build) void {
     node_mod.addImport("async", async_mod);
 	node_mod.addImport("util", util_mod);
 
+    const zquic_dep = b.dependency("zquic", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zquic_mod = zquic_dep.module("zquic");
+    node_mod.addImport("zquic", zquic_mod);
+
     const wolfssl = configureWolfssl(b, target, wolfssl_mode, wolfssl_prefix);
+    const lws = configureLibwebsockets(b, target);
 
     // ---- yggdrasil executable ---------------------------------------------
     const exe = b.addExecutable(.{
@@ -75,6 +83,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("async", async_mod);
     exe.root_module.addImport("node", node_mod);
     linkWolfssl(exe.root_module, wolfssl);
+    linkLibwebsockets(exe.root_module, lws);
 
     b.installArtifact(exe);
  
@@ -96,8 +105,9 @@ pub fn build(b: *std.Build) void {
     });
     probe.root_module.addImport("ironwood", ironwood);
     probe.root_module.addImport("node", node_mod);
-	probe.root_module.addImport("util", util_mod);
+    probe.root_module.addImport("util", util_mod);
     linkWolfssl(probe.root_module, wolfssl);
+    linkLibwebsockets(probe.root_module, lws);
 
     b.installArtifact(probe);
 
@@ -162,7 +172,9 @@ pub fn build(b: *std.Build) void {
     node_tests.root_module.addImport("xev", xev_mod);
     node_tests.root_module.addImport("async", async_mod);
 	node_tests.root_module.addImport("util", util_mod);
+    node_tests.root_module.addImport("zquic", zquic_mod);
     linkWolfssl(node_tests.root_module, wolfssl);
+    linkLibwebsockets(node_tests.root_module, lws);
     const run_node_tests = b.addRunArtifact(node_tests);
     test_step.dependOn(&run_node_tests.step);
 }
@@ -211,10 +223,11 @@ fn configureWolfssl(
         \\mkdir -p "$out"
         \\cp -R "$src" "$out/src"
         \\cd "$out/src"
-        \\if [ ! -x ./configure ]; then
-        \\  ./autogen.sh
+        \\chmod +x ./autogen.sh ./configure 2>/dev/null || true
+        \\if [ ! -f ./configure ]; then
+        \\  sh ./autogen.sh
         \\fi
-        \\./configure \
+        \\sh ./configure \
         \\  --prefix="$out/install" \
         \\  --enable-static \
         \\  --disable-shared \
@@ -255,10 +268,69 @@ fn linkWolfssl(module: *std.Build.Module, wolfssl: WolfsslPaths) void {
 		// (CertOpenSystemStoreA/CertEnumCertificatesInStore/CertCloseStore).
 		module.linkSystemLibrary("crypt32", .{});
 		module.linkSystemLibrary("ws2_32", .{});
+		module.linkSystemLibrary("iphlpapi", .{});
 	} else {
 		module.linkSystemLibrary("m", .{});
 		module.linkSystemLibrary("pthread", .{});
 	}
+}
+
+const LwsPaths = struct {
+    include_dir: std.Build.LazyPath,
+    static_lib: std.Build.LazyPath,
+};
+
+fn configureLibwebsockets(b: *std.Build, target: std.Build.ResolvedTarget) LwsPaths {
+    if (!target.query.isNative()) {
+        @panic("bundled libwebsockets uses cmake for the native host only");
+    }
+    const lws_dep = b.dependency("libwebsockets", .{});
+    const run = b.addSystemCommand(&.{
+        "sh",
+        "-c",
+        \\
+        \\set -eu
+        \\src="$1"
+        \\out="$2"
+        \\rm -rf "$out"
+        \\mkdir -p "$out/build"
+        \\cmake -S "$src" -B "$out/build" \
+        \\  -DCMAKE_INSTALL_PREFIX="$out/install" \
+        \\  -DCMAKE_BUILD_TYPE=Release \
+        \\  -DCMAKE_C_FLAGS="-Wno-error -Wno-unused-label" \
+        \\  -DLWS_WITH_SSL=OFF \
+        \\  -DLWS_WITH_SHARED=OFF \
+        \\  -DLWS_WITH_STATIC=ON \
+        \\  -DLWS_WITHOUT_TESTAPPS=ON \
+        \\  -DLWS_WITHOUT_TEST_SERVER=ON \
+        \\  -DLWS_WITHOUT_TEST_CLIENT=ON \
+        \\  -DLWS_WITHOUT_TEST_PING=ON \
+        \\  -DLWS_WITHOUT_TEST_ECHO=ON \
+        \\  -DLWS_WITH_MINIMAL_EXAMPLES=OFF \
+        \\  -DLWS_WITH_HTTP2=OFF \
+        \\  -DLWS_IPV6=ON
+        \\cmake --build "$out/build" -j"${NPROC:-2}"
+        \\cmake --install "$out/build"
+        \\if [ -f "$out/install/lib64/libwebsockets.a" ] && [ ! -f "$out/install/lib/libwebsockets.a" ]; then
+        \\  mkdir -p "$out/install/lib"
+        \\  cp "$out/install/lib64/libwebsockets.a" "$out/install/lib/"
+        \\fi
+        \\test -f "$out/install/lib/libwebsockets.a"
+        ,
+        "build-libwebsockets",
+    });
+    run.addDirectoryArg(lws_dep.path("."));
+    const out_dir = run.addOutputDirectoryArg("libwebsockets");
+    return .{
+        .include_dir = out_dir.path(b, "install/include"),
+        .static_lib = out_dir.path(b, "install/lib/libwebsockets.a"),
+    };
+}
+
+fn linkLibwebsockets(module: *std.Build.Module, lws: LwsPaths) void {
+    module.addIncludePath(lws.include_dir);
+    module.addObjectFile(lws.static_lib);
+    module.link_libc = true;
 }
 
 /// Locate the architecture-appropriate `wintun.dll` inside the `wintun`
