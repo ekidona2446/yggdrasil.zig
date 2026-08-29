@@ -6,6 +6,7 @@
 //! `Core.handleFrame` and flushing the resulting `OutgoingFrame`s back out.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const xev = @import("xev");
 const ironwood = @import("ironwood");
 const node = @import("node.zig");
@@ -64,7 +65,123 @@ pub const LinkOptions = struct {
     ws_path: []const u8 = "/",
     /// Host header / SNI name for WebSocket/TLS (not necessarily an IP).
     ws_host: []const u8 = "",
+    /// Pinned remote signing keys (`?key=HEX`, repeatable). When non-empty, a
+    /// peer whose handshake carries a different key is rejected, exactly like
+    /// the reference's `linkInfo.pinnedEd25519Keys`.
+    pinned_keys: []const PublicKey = &.{},
+    /// Normalised URI (query string stripped), as reported by `getPeers`.
+    uri: []const u8 = "",
+    /// Source interface for the link (`interface` in an admin `addPeer`). The
+    /// reference uses it both to `SO_BINDTODEVICE` the socket and as half of the
+    /// duplicate-link key; we honour the key (so `addPeer` with the same URI on a
+    /// different interface is a new link, as in Go) but do not bind the socket --
+    /// that needs `CAP_NET_RAW`, and the dial path has no socket-option hook yet.
+    sintf: []const u8 = "",
 };
+
+/// Errors the reference's `links.add` can report for a malformed URI; the
+/// admin `addPeer` handler surfaces the same strings.
+/// Everything an admin-initiated peering change can fail with: the URI
+/// handling in `LinkError` plus the allocation/parse failures the helpers
+/// propagate. Kept as one named set so `admin.zig` (whose error set is
+/// `LinkError || {...}`) can surface all of them with distinct messages.
+pub const PeerOpError = LinkError || error{OutOfMemory};
+
+/// `src/core/link.go`'s `linkError` constants, which is what the admin API
+/// reports verbatim when a peering URI is rejected.
+pub const LinkError = error{
+    InvalidURI,
+    UnknownScheme,
+    PinnedKeyInvalid,
+    PriorityInvalid,
+    PasswordInvalid,
+    MaxBackoffInvalid,
+    UnsupportedSNI,
+    PeerExists,
+    PeerNotFound,
+    ResolveFailed,
+    NoSuitableIPs,
+    ConnectFailed,
+    ConnectedToSelf,
+    NotSupported,
+};
+
+/// Percent-decode `s` into `out` (query-string values may be escaped).
+fn percentDecode(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
+    var buf = std.ArrayListUnmanaged(u8).empty;
+    errdefer buf.deinit(gpa);
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (c == '%' and i + 2 < s.len) {
+            const hi = std.fmt.charToDigit(s[i + 1], 16) catch return LinkError.InvalidURI;
+            const lo = std.fmt.charToDigit(s[i + 2], 16) catch return error.InvalidURI;
+            try buf.append(gpa, hi * 16 + lo);
+            i += 3;
+        } else if (c == '+') {
+            try buf.append(gpa, ' ');
+            i += 1;
+        } else {
+            try buf.append(gpa, c);
+            i += 1;
+        }
+    }
+    return buf.toOwnedSlice(gpa);
+}
+
+/// Parse the query string of a peer/listen URI into `LinkOptions`, matching the
+/// reference's accepted keys: `key` (repeatable), `priority`, `password`,
+/// `maxbackoff` and `sni`.
+pub fn parseLinkQuery(gpa: std.mem.Allocator, uri: []const u8, base: LinkOptions) PeerOpError!LinkOptions {
+    const qpos = std.mem.indexOfScalar(u8, uri, '?') orelse return base;
+    var opts = base;
+    const query = uri[qpos + 1 ..];
+
+    var pinned = std.ArrayListUnmanaged(PublicKey).empty;
+    errdefer pinned.deinit(gpa);
+
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        if (pair.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const raw_key = pair[0..eq];
+        const raw_val = pair[eq + 1 ..];
+        const key = try percentDecode(gpa, raw_key);
+        defer gpa.free(key);
+        const val = try percentDecode(gpa, raw_val);
+        defer gpa.free(val);
+
+        if (std.mem.eql(u8, key, "key")) {
+            if (val.len != 64) return LinkError.PinnedKeyInvalid;
+            var pk: PublicKey = undefined;
+            _ = std.fmt.hexToBytes(&pk, val) catch return LinkError.PinnedKeyInvalid;
+            try pinned.append(gpa, pk);
+        } else if (std.mem.eql(u8, key, "priority")) {
+            const p = std.fmt.parseInt(u8, val, 10) catch return LinkError.PriorityInvalid;
+            opts.priority = p;
+        } else if (std.mem.eql(u8, key, "password")) {
+            if (val.len > 64) return LinkError.PasswordInvalid; // blake2b.KeySize
+            // The LinkOptions.password slice must outlive the link; the URI
+            // text is owned by the config/CLI layer, so take a copy of the
+            // decoded value owned by the manager.
+            opts.password = try gpa.dupe(u8, val);
+        } else if (std.mem.eql(u8, key, "maxbackoff")) {
+            const secs = std.fmt.parseInt(u64, val, 10) catch return LinkError.MaxBackoffInvalid;
+            opts.max_backoff_ns = secs * std.time.ns_per_s;
+        } else if (std.mem.eql(u8, key, "sni")) {
+            opts.tls_sni = try gpa.dupe(u8, val);
+        }
+    }
+    if (pinned.items.len > 0) opts.pinned_keys = try pinned.toOwnedSlice(gpa);
+    return opts;
+}
+
+/// Strip scheme-query from a URI the way the reference's `urlForLinkInfo` does
+/// (`u.RawQuery = ""` before `String()`).
+pub fn normalizePeerUri(gpa: std.mem.Allocator, uri: []const u8) error{OutOfMemory}![]u8 {
+    const q = std.mem.indexOfScalar(u8, uri, '?') orelse return gpa.dupe(u8, uri);
+    return gpa.dupe(u8, uri[0..q]);
+}
 
 fn logInfo(comptime fmt: []const u8, args: anytype) void {
     std.debug.print("[ygg] " ++ fmt ++ "\n", args);
@@ -88,9 +205,18 @@ pub const ParsedURI = struct {
     path: []const u8,
 };
 
-pub fn parsePeerURI(uri: []const u8) !ParsedURI {
-    const scheme_end = std.mem.indexOf(u8, uri, "://") orelse return error.InvalidURI;
+pub fn parsePeerURI(uri: []const u8) LinkError!ParsedURI {
+    // `url.Parse` accepts anything without a scheme; the *scheme* is checked
+    // separately by the reference (`links.dialerFor`'s switch), so a missing or
+    // unknown one reports "link schema unknown" rather than a parse error.
+    const scheme_end = std.mem.indexOf(u8, uri, "://") orelse return error.UnknownScheme;
     const scheme = uri[0..scheme_end];
+    const known = [_][]const u8{ "tcp", "tls", "unix", "ws", "wss", "quic" };
+    var known_scheme = false;
+    for (known) |k| {
+        if (std.ascii.eqlIgnoreCase(scheme, k)) known_scheme = true;
+    }
+    if (!known_scheme) return error.UnknownScheme;
     const rest = uri[scheme_end + 3 ..];
     const addr_part = if (std.mem.indexOfScalar(u8, rest, '?')) |qpos| rest[0..qpos] else rest;
     const hp = try extractHostPort(addr_part);
@@ -107,18 +233,24 @@ fn stripPath(hostport: []const u8) struct { hp: []const u8, path: []const u8 } {
     return .{ .hp = hostport, .path = "/" };
 }
 
-fn extractHostPort(addr_part: []const u8) !HostPort {
+/// Split `host:port` / `[v6host]:port` / `[v6host]:port/path`. A bad port is a
+/// bad URI, so `parseInt`'s own errors are folded into `InvalidURI` -- that
+/// keeps the whole URI parser's error set at exactly `LinkError`, which the
+/// admin layer maps to Go's `unable to parse peering URI`.
+fn extractHostPort(addr_part: []const u8) LinkError!HostPort {
     if (addr_part.len == 0) return error.InvalidURI;
     if (addr_part[0] == '[') {
         const closing = std.mem.indexOfScalar(u8, addr_part, ']') orelse return error.InvalidURI;
         const after_bracket = addr_part[closing + 1 ..];
         if (after_bracket.len == 0 or after_bracket[0] != ':') return error.InvalidURI;
         const split = stripPath(after_bracket[1..]);
-        return .{ .host = addr_part[1..closing], .port = try std.fmt.parseInt(u16, split.hp, 10), .path = split.path };
+        const port = std.fmt.parseInt(u16, split.hp, 10) catch return error.InvalidURI;
+        return .{ .host = addr_part[1..closing], .port = port, .path = split.path };
     } else {
         const colon = std.mem.lastIndexOfScalar(u8, addr_part, ':') orelse return error.InvalidURI;
         const split = stripPath(addr_part[colon + 1 ..]);
-        return .{ .host = addr_part[0..colon], .port = try std.fmt.parseInt(u16, split.hp, 10), .path = split.path };
+        const port = std.fmt.parseInt(u16, split.hp, 10) catch return error.InvalidURI;
+        return .{ .host = addr_part[0..colon], .port = port, .path = split.path };
     }
 }
 
@@ -184,6 +316,38 @@ const PeerConn = struct {
     closing: bool = false,
     established: bool = false,
 
+    // ---- admin-visible link state ---------------------------------------
+    // The reference implementation wraps every peer connection in a
+    // `linkConn` that counts bytes and records when the link came up, and
+    // keeps the (query-string-stripped) peering URI as the link's identity;
+    // all three are reported through the admin socket, so we track them here
+    // rather than in the router, where they don't belong.
+
+    /// Normalised peer URI (`tcp://host:port`, no query string) as it appears
+    /// in `getPeers`' `remote` field. Empty (omitempty) until assigned.
+    uri: []const u8 = "",
+    /// True for connections we accepted rather than dialled.
+    inbound: bool = false,
+    rx_bytes: u64 = 0,
+    tx_bytes: u64 = 0,
+    /// Counters and timestamp as of the previous `snapshotPeers` call, used
+    /// to derive the one-second-window rates the reference reports.
+    rate_last_rx: u64 = 0,
+    rate_last_tx: u64 = 0,
+    rate_last_ns: u64 = 0,
+    rx_rate: u64 = 0,
+    tx_rate: u64 = 0,
+    /// Guard so the dial reference is returned exactly once even if close is
+    /// reached twice through different paths.
+    dial_ref_released: bool = false,
+    /// Set when the handshake completes, i.e. `uptime` in the admin output
+    /// measures the *peering*, not the raw TCP connection (a connection that
+    /// never completes a handshake has no uptime to report).
+    up_ns: u64 = 0,
+    /// Last link-level failure, surfaced as `last_error`/`last_error_time`.
+    last_error: []const u8 = "",
+    last_error_ns: u64 = 0,
+
     /// Per-slot "is a libxev completion outstanding in this slot" flags. We
     /// must not free `PeerConn` until every slot that ever had a completion
     /// submitted against it has fired its callback for the last time --
@@ -239,6 +403,8 @@ const PeerConn = struct {
         const gpa = self.manager.gpa;
         self.read_buf.deinit(gpa);
         self.ws_raw.deinit(gpa);
+        if (self.uri.len > 0) gpa.free(self.uri);
+        if (self.last_error.len > 0) gpa.free(self.last_error);
         for (self.write_queue.items) |w| gpa.free(w.data);
         self.write_queue.deinit(gpa);
         self.keepalive_timer.deinit();
@@ -257,9 +423,23 @@ const DialState = struct {
     manager: *NetworkManager,
     host: []u8,
     port: u16,
+    /// Normalised URI (query string stripped) -- this is the identity the
+    /// reference uses both for `getPeers`' `remote` field and for
+    /// `removePeer` lookups.
+    uri: []const u8 = "",
     options: LinkOptions,
     backoff_ns: u64,
     cancelled: bool = false,
+    last_error: bool = false,
+    /// How many things may still touch this dial: the dial table itself, any
+    /// completion in flight (`connect_completion`, `timer_completion`) and
+    /// each `PeerConn` spawned from it. `removeOutboundPeer` cannot simply
+    /// `destroy()` the state -- the event loop may already hold a queued
+    /// callback whose userdata points at it -- so teardown goes through
+    /// `retireDial`/`releaseDialRef` and the memory is freed by whichever
+    /// reference is dropped last.
+    refs: usize = 1,
+    retired: bool = false,
     timer: xev.Timer,
     timer_completion: xev.Completion = undefined,
     connect_completion: xev.Completion = undefined,
@@ -360,12 +540,7 @@ pub const NetworkManager = struct {
     }
 
     pub fn deinit(self: *NetworkManager) void {
-        var it = self.conns.first;
-        while (it) |n| {
-            const next = n.next;
-            it = next;
-        }
-        for (self.listeners.items) |l| self.gpa.destroy(l);
+        for (self.listeners.items) |l| l.deinit(self.gpa);
         self.listeners.deinit(self.gpa);
         if (self.tls_state) |*s| {
             tls_wolfssl.freeCtx(s.client_ctx);
@@ -373,9 +548,11 @@ pub const NetworkManager = struct {
             s.identity.deinit(self.gpa);
             tls_wolfssl.globalDeinit();
         }
-        for (self.dials.items) |d| {
-            self.gpa.free(d.host);
-            self.gpa.destroy(d);
+        while (self.dials.pop()) |d| {
+            d.retired = true;
+            d.cancelled = true;
+            d.refs = 1; // nothing else is alive at this point
+            self.releaseDialRef(d);
         }
         self.dials.deinit(self.gpa);
     }
@@ -425,37 +602,121 @@ pub const NetworkManager = struct {
     // Outbound dialing with DNS + exponential backoff
     // -----------------------------------------------------------------
 
-    pub fn addOutboundPeer(self: *NetworkManager, uri: []const u8, options_in: LinkOptions) !void {
+    pub fn addOutboundPeer(self: *NetworkManager, uri: []const u8, options_in: LinkOptions) PeerOpError!void {
         const parsed = try parsePeerURI(uri);
         const host_dup = try self.gpa.dupe(u8, parsed.host);
         errdefer self.gpa.free(host_dup);
 
-        var options = options_in;
+        var options = try parseLinkQuery(self.gpa, uri, options_in);
         options.use_tls = std.mem.eql(u8, parsed.scheme, "tls") or std.mem.eql(u8, parsed.scheme, "wss");
         options.use_ws = std.mem.eql(u8, parsed.scheme, "ws") or std.mem.eql(u8, parsed.scheme, "wss");
         options.use_quic = std.mem.eql(u8, parsed.scheme, "quic");
         options.ws_path = parsed.path;
         options.ws_host = parsed.host;
+        options.uri = try normalizePeerUri(self.gpa, uri);
+        errdefer self.gpa.free(options.uri);
+
+        // Refuse a duplicate the way the reference does (`link already exists`),
+        // so `addPeer` over the admin socket reports the same thing.
+        for (self.dials.items) |d| {
+            // The `errdefer` above owns `options.uri` until the dial table takes
+            // it over, so an early error return must not free it as well.
+            // Go keys a link on (uri, source interface), so both must match.
+            if (std.mem.eql(u8, d.uri, options.uri) and std.mem.eql(u8, d.options.sintf, options.sintf)) {
+                return LinkError.PeerExists;
+            }
+        }
 
         if (options.use_quic) {
             self.startQuicDial(host_dup, parsed.port, options) catch |err| {
                 logInfo("quic://{s}:{d} setup failed: {}", .{ parsed.host, parsed.port, err });
                 self.gpa.free(host_dup);
+                self.gpa.free(options.uri);
             };
             return;
         }
 
+        if (options.sintf.len > 0) {
+            options.sintf = try self.gpa.dupe(u8, options.sintf);
+        }
         const dial = try self.gpa.create(DialState);
         dial.* = .{
             .manager = self,
             .host = host_dup,
             .port = parsed.port,
+            .uri = options.uri,
             .options = options,
             .backoff_ns = MINIMUM_BACKOFF_NS,
             .timer = try xev.Timer.init(),
         };
         try self.dials.append(self.gpa, dial);
         self.attemptDial(dial);
+    }
+
+    fn refDial(dial: *DialState) void {
+        dial.refs += 1;
+    }
+
+    /// Drop the dial table's reference (or a connection's) and free the state
+    /// once nothing can reach it any more.
+    fn retireDial(self: *NetworkManager, dial: *DialState) void {
+        dial.retired = true;
+        dial.cancelled = true;
+        dial.manager = self;
+        self.releaseDialRef(dial);
+    }
+
+    fn releaseDialRef(self: *NetworkManager, dial: *DialState) void {
+        std.debug.assert(dial.refs > 0); // an unbalanced release is a bug, not a state
+        dial.refs -= 1;
+        if (dial.refs != 0 or !dial.retired) return;
+        // Only reached once the dial has left `self.dials`, so no dangling
+        // entry is left behind in the table.
+        if (dial.host.len > 0) self.gpa.free(dial.host);
+        if (dial.uri.len > 0) self.gpa.free(dial.uri);
+        if (dial.options.password.len > 0) self.gpa.free(dial.options.password);
+        if (dial.options.sintf.len > 0) self.gpa.free(dial.options.sintf);
+        if (dial.options.pinned_keys.len > 0) self.gpa.free(dial.options.pinned_keys);
+        dial.timer.deinit();
+        self.gpa.destroy(dial);
+    }
+
+    /// Drop a configured outbound peer (and disconnect it if it is currently
+    /// up). Mirrors `core.RemovePeer`, which matches on the query-stripped URI.
+    /// Drop a configured dial. `sintf` is the source interface the link was added
+    /// with; a link only matches when both the URI and the interface agree, as in
+    /// the reference (`removePeer` with the wrong interface reports
+    /// `peer is not configured`).
+    pub fn removeOutboundPeer(self: *NetworkManager, uri: []const u8, sintf: []const u8) PeerOpError!void {
+        const want = try normalizePeerUri(self.gpa, uri);
+        defer self.gpa.free(want);
+        var found = false;
+        for (self.dials.items, 0..) |d, i| {
+            if (!std.mem.eql(u8, d.uri, want) or !std.mem.eql(u8, d.options.sintf, sintf)) continue;
+            found = true;
+            _ = self.dials.orderedRemove(i);
+            // A queued `onRedialTimer`/`onConnectComplete` may still name this
+            // dial, so hand over a reference that those callbacks drop rather
+            // than freeing it here. No `Timer.cancel` is issued: libxev's
+            // cancel needs a second live completion slot, which a dial that is
+            // being torn down has none of, and `cancelled` already makes the
+            // outstanding callback a no-op.
+            d.retired = true;
+            d.cancelled = true;
+            self.releaseDialRef(d);
+            break;
+        }
+        // Also hang up any live connection that came from this dial.
+        var it = self.conns.first;
+        while (it) |n| {
+            const next = n.next;
+            const conn: *PeerConn = @fieldParentPtr("list_node", n);
+            if (conn.dial) |d| {
+                if (std.mem.eql(u8, d.uri, want) and std.mem.eql(u8, d.options.sintf, sintf)) self.closeConn(conn);
+            }
+            it = next;
+        }
+        if (!found) return LinkError.PeerNotFound;
     }
 
     fn attemptDial(self: *NetworkManager, dial: *DialState) void {
@@ -481,6 +742,11 @@ pub const NetworkManager = struct {
             scheduleRedial(dial);
             return;
         };
+        // The reference belongs to the in-flight connect; `onConnectComplete` drops
+        // it whichever way the dial went. Without it the accounting is short by one
+        // for every failed connection, which underflows `refs` (and would free a
+        // dial that is still in the table) on the second attempt.
+        refDial(dial);
         dial.tcp.connect(dial.manager.loop, &dial.connect_completion, addr, DialState, dial, onConnectComplete);
     }
 
@@ -488,9 +754,14 @@ pub const NetworkManager = struct {
         _ = loop;
         _ = c;
         const dial = ud.?;
+        defer dial.manager.releaseDialRef(dial);
         if (dial.cancelled) return .disarm;
         r catch |err| {
             logInfo("connect to {s}:{d} failed: {}", .{ dial.host, dial.port, err });
+            // The reference records the dial failure on the link state; we only
+            // have a link once a socket exists, so remember it on the dial and
+            // let a later snapshot surface it if one ever gets attached.
+            dial.last_error = true;
             scheduleRedial(dial);
             return .disarm;
         };
@@ -506,6 +777,8 @@ pub const NetworkManager = struct {
         const wait_ns = dial.backoff_ns;
         dial.backoff_ns = @min(dial.backoff_ns * 2, dial.options.max_backoff_ns);
         const wait_ms: u64 = wait_ns / std.time.ns_per_ms;
+        // The queued callback holds a reference until it runs.
+        refDial(dial);
         dial.timer.run(dial.manager.loop, &dial.timer_completion, wait_ms, DialState, dial, onRedialTimer);
     }
 
@@ -514,6 +787,7 @@ pub const NetworkManager = struct {
         _ = c;
         _ = r catch {};
         const dial = ud.?;
+        defer dial.manager.releaseDialRef(dial);
         if (dial.cancelled) return .disarm;
         dial.manager.attemptDial(dial);
         return .disarm;
@@ -523,20 +797,48 @@ pub const NetworkManager = struct {
     // Inbound listening
     // -----------------------------------------------------------------
 
+    /// The error set is inferred: besides `LinkError` (which is what an admin
+    /// `listen` refusal would report) a listener can fail inside libxev or the
+    /// resolver, and those codes are only ever logged by the caller at startup.
     pub fn addListener(self: *NetworkManager, uri: []const u8) !void {
         const parsed = try parsePeerURI(uri);
-        const addrs = try dns.resolve(self.gpa, parsed.host, parsed.port);
+        // `LinkError` is the set the admin API reports, so resolver failures are
+        // folded into it rather than leaking `dns`'s own error set to callers.
+        const addrs = dns.resolve(self.gpa, parsed.host, parsed.port) catch |err| {
+            logInfo("resolve {s}:{d} failed: {}", .{ parsed.host, parsed.port, err });
+            return error.ResolveFailed;
+        };
         defer self.gpa.free(addrs);
-        if (addrs.len == 0) return error.NoAddresses;
+        if (addrs.len == 0) return error.NoSuitableIPs;
         const addr = addrs[0];
 
+        var options = try parseLinkQuery(self.gpa, uri, .{
+            .use_tls = std.mem.eql(u8, parsed.scheme, "tls") or std.mem.eql(u8, parsed.scheme, "wss"),
+            .use_ws = std.mem.eql(u8, parsed.scheme, "ws") or std.mem.eql(u8, parsed.scheme, "wss"),
+            .use_quic = std.mem.eql(u8, parsed.scheme, "quic"),
+            .ws_path = parsed.path,
+            .ws_host = parsed.host,
+        });
+        // Inbound links report their *remote* address as the URI (built in
+        // `tryParseHandshake`), so nothing is stored in `uri` here beyond the
+        // listener's own scheme/opts, which accepted connections inherit.
+        options.uri = try normalizePeerUri(self.gpa, uri);
+        errdefer self.gpa.free(options.uri);
+
         const listener = try self.gpa.create(ListenerState);
-        listener.* = .{ .manager = self, .tcp = try xev.TCP.init(addr), .use_tls = std.mem.eql(u8, parsed.scheme, "tls") };
+        listener.* = .{
+            .manager = self,
+            .tcp = try xev.TCP.init(addr),
+            .use_tls = options.use_tls,
+            .use_ws = options.use_ws,
+            .scheme = try self.gpa.dupe(u8, parsed.scheme),
+            .options = options,
+        };
         try listener.tcp.bind(addr);
         try listener.tcp.listen(128);
         try self.listeners.append(self.gpa, listener);
         listener.tcp.accept(self.loop, &listener.accept_completion, ListenerState, listener, onAccept);
-        logInfo("listening on {f} (tls={})", .{ addr, listener.use_tls });
+        logInfo("{s} listener started on {f} (tls={})", .{ parsed.scheme, addr, listener.use_tls });
     }
 
     fn onAccept(ud: ?*ListenerState, loop: *xev.Loop, c: *xev.Completion, r: xev.AcceptError!xev.TCP) xev.CallbackAction {
@@ -547,7 +849,9 @@ pub const NetworkManager = struct {
             listener.tcp.accept(loop, &listener.accept_completion, ListenerState, listener, onAccept);
             return .disarm;
         };
-        listener.manager.spawnConn(tcp, .{ .persistent = false, .use_tls = listener.use_tls }, null) catch |err| {
+        var opts = listener.options;
+        opts.persistent = false;
+        listener.manager.spawnConn(tcp, opts, null) catch |err| {
             logInfo("spawnConn (inbound) failed: {}", .{err});
         };
         // Re-arm the listener for the next incoming connection.
@@ -560,6 +864,7 @@ pub const NetworkManager = struct {
     // -----------------------------------------------------------------
 
     fn spawnConn(self: *NetworkManager, tcp: xev.TCP, options: LinkOptions, dial: ?*DialState) !void {
+        if (dial) |d| refDial(d);
         const conn = try self.gpa.create(PeerConn);
         conn.* = .{
             .manager = self,
@@ -569,6 +874,8 @@ pub const NetworkManager = struct {
             .use_tls = options.use_tls,
             .use_ws = options.use_ws,
             .pending_options = options,
+            .inbound = dial == null,
+            .uri = if (options.uri.len > 0) try self.gpa.dupe(u8, options.uri) else "",
         };
         if (options.use_ws) {
             ws.generateKey(&conn.ws_key_b64);
@@ -704,6 +1011,13 @@ pub const NetworkManager = struct {
         }
     }
 
+    /// Record why a link went down, for `getPeers`' `last_error`.
+    fn noteLinkError(self: *NetworkManager, conn: *PeerConn, err: anyerror) void {
+        if (conn.last_error.len > 0) self.gpa.free(conn.last_error);
+        conn.last_error = std.fmt.allocPrint(self.gpa, "{s}", .{@errorName(err)}) catch "";
+        conn.last_error_ns = monotonicNs();
+    }
+
     fn closeConn(self: *NetworkManager, conn: *PeerConn) void {
         if (conn.closing) return;
         conn.closing = true;
@@ -712,6 +1026,14 @@ pub const NetworkManager = struct {
                 self.flushFrames(frames);
             } else |_| {}
             logInfo("peer disconnected: {x}", .{conn.peer_key});
+        }
+        // Give back the dial reference this connection was holding before any
+        // callback that may resurrect the dial runs.
+        if (conn.dial) |d| {
+            if (!conn.dial_ref_released) {
+                conn.dial_ref_released = true;
+                self.releaseDialRef(d);
+            }
         }
         self.conns.remove(&conn.list_node);
         if (conn.quic) |link| {
@@ -753,6 +1075,7 @@ pub const NetworkManager = struct {
         const conn = ud.?;
         const n = r catch |err| {
             if (err != error.EOF) logInfo("read error: {}", .{err});
+            if (err != error.EOF) conn.manager.noteLinkError(conn, err);
             conn.read_active = false;
             conn.manager.closeConn(conn);
             conn.maybeDestroy();
@@ -765,6 +1088,7 @@ pub const NetworkManager = struct {
             return .disarm;
         }
         const raw = buf.slice[0..n];
+        conn.rx_bytes += n;
 
         if (conn.tls) |tls| {
             conn.manager.handleTlsReadable(conn, tls, raw) catch |err| {
@@ -1093,9 +1417,34 @@ pub const NetworkManager = struct {
         }
         if (!self.core.isAllowed(&peer_meta.public_key)) return error.PeerNotAllowed;
 
+        // `?key=HEX` pinning, like the reference's `pinnedEd25519Keys`.
+        {
+            const pinned = if (conn.dial) |d| d.options.pinned_keys else conn.pending_options.pinned_keys;
+            if (pinned.len > 0) {
+                var ok = false;
+                for (pinned) |k| {
+                    if (std.mem.eql(u8, &k, &peer_meta.public_key)) ok = true;
+                }
+                if (!ok) {
+                    logInfo("peer key not pinned in URI, rejecting", .{});
+                    return error.PeerNotAllowed;
+                }
+            }
+        }
+
         conn.peer_key = peer_meta.public_key;
+        conn.up_ns = monotonicNs();
         var prio: u8 = peer_meta.priority;
         if (conn.dial) |dial| prio = @max(prio, dial.options.priority);
+        if (conn.dial == null and conn.uri.len == 0) {
+            // Inbound accepted connection: the reference rewrites the listener
+            // URL's host to the remote address, which is what we show.
+            const scheme = if (conn.use_tls) (if (conn.use_ws) "wss" else "tls") else (if (conn.use_ws) "ws" else "tcp");
+            if (remoteAddrString(self.gpa, conn.tcp)) |ra| {
+                conn.uri = std.fmt.allocPrint(self.gpa, "{s}://{s}", .{ scheme, ra }) catch "";
+                self.gpa.free(ra);
+            }
+        }
 
         const added = self.core.addPeer(peer_meta.public_key, prio) catch |err| {
             return err;
@@ -1185,6 +1534,7 @@ pub const NetworkManager = struct {
         const conn = ud.?;
         const n = r catch |err| {
             logInfo("write error: {}", .{err});
+            conn.manager.noteLinkError(conn, err);
             conn.write_in_flight = false;
             conn.manager.closeConn(conn);
             conn.maybeDestroy();
@@ -1209,6 +1559,7 @@ pub const NetworkManager = struct {
             pumpWrite(conn);
             return .disarm;
         }
+        conn.tx_bytes += n;
         // Full write completed: note the packet type (for keepalive/timeout
         // bookkeeping) before freeing, then pop.
         if (conn.established) {
@@ -1246,7 +1597,188 @@ pub const NetworkManager = struct {
         }
         return count;
     }
+
+    /// Take a snapshot of every link for the admin socket.
+    ///
+    /// Mirrors `core.GetPeers()`: the reference walks its *link* table, so a
+    /// peer that has connected but not finished the ironwood handshake still
+    /// shows up (without key/port/cost, which the reference fills in only from
+    /// the router), and joins each link with the router's peer entry for the
+    /// same connection -- `peer_id` is that join key here.
+    ///
+    /// Recomputing the one-second byte rates as a side effect matches the
+    /// reference's `_updateAverages` goroutine, whose staleness is what makes
+    /// `rate_*` (with its `omitempty`) vanish on brand-new links.
+    pub fn snapshotPeers(self: *NetworkManager, gpa: std.mem.Allocator) ![]PeerSnapshot {
+        const router_peers = try node.core.getRouterPeers(self.core, gpa);
+        defer gpa.free(router_peers);
+
+        var list = std.ArrayListUnmanaged(PeerSnapshot).empty;
+        errdefer list.deinit(gpa);
+
+        var it = self.conns.first;
+        while (it) |node_h| : (it = node_h.next) {
+            const conn: *PeerConn = @fieldParentPtr("list_node", node_h);
+            const now = monotonicNs();
+
+            if (conn.rate_last_ns == 0) {
+                conn.rate_last_ns = now;
+                conn.rate_last_rx = conn.rx_bytes;
+                conn.rate_last_tx = conn.tx_bytes;
+            } else if (now > conn.rate_last_ns) {
+                const dt = now - conn.rate_last_ns;
+                if (dt >= std.time.ns_per_s / 2) {
+                    const rx = conn.rx_bytes -| conn.rate_last_rx;
+                    const tx = conn.tx_bytes -| conn.rate_last_tx;
+                    conn.rx_rate = @intCast(rx * std.time.ns_per_s / dt);
+                    conn.tx_rate = @intCast(tx * std.time.ns_per_s / dt);
+                    conn.rate_last_rx = conn.rx_bytes;
+                    conn.rate_last_tx = conn.tx_bytes;
+                    conn.rate_last_ns = now;
+                }
+            }
+
+            var snap = PeerSnapshot{
+                // A connection spawned from a dial may not have carried the URI over
+                // (the QUIC link does not); fall back to the dial's, which is what the
+                // reference reports as `remote`.
+                .uri = if (conn.uri.len > 0) conn.uri else if (conn.dial) |d| d.uri else "",
+                .up = conn.established,
+                .inbound = conn.inbound,
+                .has_key = conn.established,
+                .key = conn.peer_key,
+                .rx_bytes = conn.rx_bytes,
+                .tx_bytes = conn.tx_bytes,
+                .rx_rate = conn.rx_rate,
+                .tx_rate = conn.tx_rate,
+                .uptime_ns = if (conn.up_ns != 0) now - conn.up_ns else 0,
+                .last_error = conn.last_error,
+                .last_error_age_ns = if (conn.last_error_ns != 0) now - conn.last_error_ns else 0,
+            };
+            if (conn.established) {
+                const addr = node.addrForKey(&conn.peer_key);
+                const txt = formatIpv6(&addr.bytes, &snap.address) catch "";
+                snap.address_len = @min(txt.len, snap.address.len);
+            }
+
+            for (router_peers) |rp| {
+                if (rp.peer_id != conn.peer_id) continue;
+                snap.port = rp.port;
+                snap.priority = rp.priority;
+                snap.cost = rp.cost;
+                snap.latency_ns = rp.latency_ns;
+                break;
+            }
+            try list.append(gpa, snap);
+        }
+
+        // A configured peer whose dial has not produced a connection yet is still a
+        // peer: the reference reports every entry of its link table, so a peer that
+        // is down shows up with `up: false` and no key. (Its `last_error` text is
+        // not carried on the dial in this port, so that field stays empty.)
+        for (self.dials.items) |d| {
+            if (d.retired) continue;
+            var live = false;
+            var cit = self.conns.first;
+            while (cit) |cn| : (cit = cn.next) {
+                const conn: *PeerConn = @fieldParentPtr("list_node", cn);
+                if (conn.dial == d) {
+                    live = true;
+                    break;
+                }
+            }
+            if (live) continue;
+            try list.append(gpa, .{ .uri = d.uri });
+        }
+        return list.toOwnedSlice(gpa);
+    }
+
+    /// Snapshots borrow their strings from the live connections, so freeing is
+    /// only the slice itself; the signature exists so the admin layer owns the
+    /// whole lifecycle without having to know that.
+    pub fn freePeerSnapshot(self: *NetworkManager, gpa: std.mem.Allocator, peers: []PeerSnapshot) void {
+        _ = self;
+        gpa.free(peers);
+    }
 };
+
+/// One row of `getPeers`: the Zig counterpart of the reference's `core.PeerInfo`
+/// joined into `admin.PeerEntry`. Fixed-size buffers for the strings that always
+/// fit (an IPv6 text form is at most 45 bytes, `last_error` is short) mean
+/// taking a snapshot cannot fail part-way through an admin reply.
+pub const PeerSnapshot = struct {
+    uri: []const u8 = "",
+    up: bool = false,
+    inbound: bool = false,
+    /// False until the ironwood handshake identifies the remote key; the
+    /// reference omits `address`/`key` in exactly that case.
+    has_key: bool = false,
+    key: PublicKey = [_]u8{0} ** 32,
+    address: [45]u8 = undefined,
+    address_len: usize = 0,
+    port: u64 = 0,
+    priority: u8 = 0,
+    cost: u64 = 0,
+    rx_bytes: u64 = 0,
+    tx_bytes: u64 = 0,
+    rx_rate: u64 = 0,
+    tx_rate: u64 = 0,
+    uptime_ns: u64 = 0,
+    latency_ns: u64 = 0,
+    last_error: []const u8 = "",
+    last_error_age_ns: u64 = 0,
+};
+
+fn formatIpv6(bytes: *const [16]u8, buf: []u8) ![]u8 {
+    var w = std.Io.Writer.fixed(buf);
+    try node.address.formatIpv6(bytes, &w);
+    return buf[0..w.end];
+}
+
+/// The socket handle behind an `xev.TCP`. libxev stores a `posix.socket_t` on
+/// epoll/kqueue/io_uring and a `HANDLE` on IOCP, where for sockets the HANDLE
+/// is the SOCKET reinterpreted, so `@intFromPtr` recovers it.
+fn tcpFd(tcp: xev.TCP) switch (builtin.os.tag) {
+    .windows => std.os.windows.ws2_32.SOCKET,
+    else => std.posix.socket_t,
+} {
+    return switch (builtin.os.tag) {
+        .windows => @bitCast(@intFromPtr(tcp.fd)),
+        else => tcp.fd,
+    };
+}
+
+/// `addr:port` text for the remote end of `tcp`, formatted like Go's
+/// `net.TCPAddr.String()` (IPv6 bracketed). Null if the platform can't say.
+fn remoteAddrString(gpa: std.mem.Allocator, tcp: xev.TCP) ?[]u8 {
+    var storage: std.posix.sockaddr.storage = std.mem.zeroes(std.posix.sockaddr.storage);
+    var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+    switch (builtin.os.tag) {
+        .windows => {
+            if (std.os.windows.ws2_32.getpeername(tcpFd(tcp), @ptrCast(&storage), &len) != 0) return null;
+        },
+        else => std.posix.getpeername(tcpFd(tcp), @ptrCast(&storage), &len) catch return null,
+    }
+    var buf: [128]u8 = undefined;
+    const txt = switch (storage.family) {
+        std.posix.AF.INET => blk: {
+            const sa: *align(1) const std.posix.sockaddr.in = @ptrCast(&storage);
+            const bytes: [4]u8 = @bitCast(sa.addr);
+            break :blk std.fmt.bufPrint(&buf, "{d}.{d}.{d}.{d}:{d}", .{
+                bytes[0], bytes[1], bytes[2], bytes[3], std.mem.bigToNative(u16, sa.port),
+            }) catch return null;
+        },
+        std.posix.AF.INET6 => blk: {
+            const sa: *align(1) const std.posix.sockaddr.in6 = @ptrCast(&storage);
+            var ip: [45]u8 = undefined;
+            var iw = std.Io.Writer.fixed(&ip);
+            node.address.formatIpv6(&sa.addr, &iw) catch return null;
+            break :blk std.fmt.bufPrint(&buf, "[{s}]:{d}", .{ ip[0..iw.end], std.mem.bigToNative(u16, sa.port) }) catch return null;
+        },
+        else => return null,
+    };
+    return gpa.dupe(u8, txt) catch null;
+}
 
 /// Queue plaintext `data` (encrypted first if the link is TLS).
 fn queueWrite(conn: *PeerConn, data: []u8) void {
@@ -1276,6 +1808,15 @@ const ListenerState = struct {
     tcp: xev.TCP,
     accept_completion: xev.Completion = undefined,
     use_tls: bool = false,
+    use_ws: bool = false,
+    scheme: []const u8 = "tcp",
+    options: LinkOptions = .{},
+
+    fn deinit(self: *ListenerState, gpa: std.mem.Allocator) void {
+        if (self.scheme.len > 0) gpa.free(self.scheme);
+        if (self.options.uri.len > 0) gpa.free(self.options.uri);
+        gpa.destroy(self);
+    }
 };
 
 // ---------------------------------------------------------------------------

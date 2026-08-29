@@ -10,6 +10,7 @@ pub const links = @import("links.zig");
 pub const firewall = @import("firewall.zig");
 pub const ipv6rwc = @import("ipv6rwc.zig");
 pub const admin = @import("admin.zig");
+pub const admin_server = @import("admin_server.zig");
 pub const tls = @import("tls.zig");
 pub const tls_wolfssl = @import("tls_wolfssl.zig");
 pub const ws = @import("ws.zig");
@@ -36,6 +37,7 @@ test {
     _ = firewall;
     _ = ipv6rwc;
     _ = admin;
+    _ = admin_server;
     _ = tls;
     _ = tls_wolfssl;
     _ = multicast;

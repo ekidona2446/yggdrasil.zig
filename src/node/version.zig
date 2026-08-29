@@ -10,6 +10,10 @@ const crypto = ironwood.crypto;
 const PublicKey = crypto.PublicKey;
 const Sig = crypto.Sig;
 
+/// Reported through the admin API (`build_version`). Keep this in step with
+/// the wire protocol we speak, not with the reference's release number.
+pub const VERSION_STRING: []const u8 = "0.0.1-dev";
+
 pub const PROTOCOL_VERSION_MAJOR: u16 = 0;
 pub const PROTOCOL_VERSION_MINOR: u16 = 5;
 

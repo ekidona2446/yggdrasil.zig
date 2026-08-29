@@ -23,31 +23,31 @@ const timemod = @import("util").time;
 ///     entropy source (monotonic clock + ASLR pointer address).
 pub fn secureRandomBytes(buf: []u8) void {
     switch (native_os) {
-		.linux => {
-			var off: usize = 0;
-			while (off < buf.len) {
-				const rc = std.os.linux.getrandom(buf.ptr + off, buf.len - off, 0);
-				const signed: isize = @bitCast(rc);
-				if (signed < 0) {
-					// EINTR or transient failure: retry.
-					continue;
-				}
-				off += rc;
-			}
+        .linux => {
+            var off: usize = 0;
+            while (off < buf.len) {
+                const rc = std.os.linux.getrandom(buf.ptr + off, buf.len - off, 0);
+                const signed: isize = @bitCast(rc);
+                if (signed < 0) {
+                    // EINTR or transient failure: retry.
+                    continue;
+                }
+                off += rc;
+            }
             return;
-		},
-		.macos, .ios, .tvos, .watchos, .visionos, .freebsd, .openbsd, .netbsd, .dragonfly => {
-			if (@hasDecl(std.c, "arc4random_buf") and @TypeOf(std.c.arc4random_buf) != void) {
-				std.c.arc4random_buf(buf.ptr, buf.len);
-				return;
-			}
-		},
-		.windows => {
-			if (windowsSecureRandomBytes(buf)) return;
-		},
-		else => {},
+        },
+        .macos, .ios, .tvos, .watchos, .visionos, .freebsd, .openbsd, .netbsd, .dragonfly => {
+            if (@hasDecl(std.c, "arc4random_buf") and @TypeOf(std.c.arc4random_buf) != void) {
+                std.c.arc4random_buf(buf.ptr, buf.len);
+                return;
+            }
+        },
+        .windows => {
+            if (windowsSecureRandomBytes(buf)) return;
+        },
+        else => {},
     }
-	fallbackRandomBytes(buf);
+    fallbackRandomBytes(buf);
 }
 
 fn fallbackRandomBytes(buf: []u8) void {
@@ -73,21 +73,21 @@ const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x00000002;
 
 extern "bcrypt" fn BCryptGenRandom(
     hAlgorithm: ?*anyopaque,
-	pbBuffer: [*]u8,
-	cbBuffer: u32,
-	dwFlags: u32,
+    pbBuffer: [*]u8,
+    cbBuffer: u32,
+    dwFlags: u32,
 ) callconv(.winapi) i32; // NTSTATUS; 0 == STATUS_SUCCESS
 
 fn windowsSecureRandomBytes(buf: []u8) bool {
-	if (buf.len == 0) return true;
-	var off: usize = 0;
-	while (off < buf.len) {
-		const chunk_len: u32 = @intCast(@min(buf.len - off, std.math.maxInt(u32)));
-		const status = BCryptGenRandom(null, buf.ptr + off, chunk_len, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-		if (status != 0) return false;
-		off += chunk_len;
-	}
-	return true;
+    if (buf.len == 0) return true;
+    var off: usize = 0;
+    while (off < buf.len) {
+        const chunk_len: u32 = @intCast(@min(buf.len - off, std.math.maxInt(u32)));
+        const status = BCryptGenRandom(null, buf.ptr + off, chunk_len, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if (status != 0) return false;
+        off += chunk_len;
+    }
+    return true;
 }
 
 pub const PUBLIC_KEY_SIZE: usize = 32;

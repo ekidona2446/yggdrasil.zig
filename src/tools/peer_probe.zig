@@ -56,7 +56,7 @@ pub fn main(init: std.process.Init) !void {
 
     const args = init.minimal.args;
     var args_iter = try std.process.Args.Iterator.initAllocator(args, gpa);
-	defer args_iter.deinit();
+    defer args_iter.deinit();
     _ = args_iter.next();
 
     const uri = args_iter.next() orelse {
@@ -78,25 +78,25 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
     const family: u16 = if (is_windows) win.ws2_32.AF.INET else @intCast(c.AF.INET);
-	var sa: sockaddr_in = .{ .family = family, .port = std.mem.nativeToBig(u16, parsed.port), .addr = ip_be };
+    var sa: sockaddr_in = .{ .family = family, .port = std.mem.nativeToBig(u16, parsed.port), .addr = ip_be };
 
-	const t0 = timemod.monotonicNanos();
+    const t0 = timemod.monotonicNanos();
 
-	if (is_windows) {
-		const sock = win.socket(win.ws2_32.AF.INET, win.ws2_32.SOCK.STREAM, 0);
-		if (sock == win.INVALID_SOCKET) {
-			std.debug.print("FAIL|socket\n", .{});
-			return;
-		}
-		defer _ = win.closesocket(sock);
+    if (is_windows) {
+        const sock = win.socket(win.ws2_32.AF.INET, win.ws2_32.SOCK.STREAM, 0);
+        if (sock == win.INVALID_SOCKET) {
+            std.debug.print("FAIL|socket\n", .{});
+            return;
+        }
+        defer _ = win.closesocket(sock);
 
-		if (win.connect(sock, @ptrCast(&sa), @sizeOf(sockaddr_in)) != 0) {
-			std.debug.print("FAIL|connect\n", .{});
-			return;
-		}
-		const t1 = timemod.monotonicNanos();
+        if (win.connect(sock, @ptrCast(&sa), @sizeOf(sockaddr_in)) != 0) {
+            std.debug.print("FAIL|connect\n", .{});
+            return;
+        }
+        const t1 = timemod.monotonicNanos();
 
-		const our_meta = Metadata.init(our_id.public_key, 0);
+        const our_meta = Metadata.init(our_id.public_key, 0);
         const our_msg = our_meta.encode(&our_id, password, gpa) catch |e| {
             std.debug.print("FAIL|encode|{}\n", .{e});
             return;
@@ -176,9 +176,15 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const body_len: u16 = std.mem.readInt(u16, header[4..6], .big);
-    if (body_len > 8192) { std.debug.print("FAIL|body_too_big|{}\n", .{body_len}); return; }
+    if (body_len > 8192) {
+        std.debug.print("FAIL|body_too_big|{}\n", .{body_len});
+        return;
+    }
 
-    const body = gpa.alloc(u8, body_len) catch |e| { std.debug.print("FAIL|alloc|{}\n", .{e}); return; };
+    const body = gpa.alloc(u8, body_len) catch |e| {
+        std.debug.print("FAIL|alloc|{}\n", .{e});
+        return;
+    };
     defer gpa.free(body);
 
     var total_read: usize = 0;
@@ -197,8 +203,14 @@ fn report(gpa: std.mem.Allocator, header: *const [6]u8, body: []const u8, passwo
     const connect_us = (t1 - t0) / 1000;
     var full = std.ArrayListUnmanaged(u8).empty;
     defer full.deinit(gpa);
-    full.appendSlice(gpa, header) catch { std.debug.print("FAIL|oom\n", .{}); return; };
-    full.appendSlice(gpa, body) catch { std.debug.print("FAIL|oom\n", .{}); return; };
+    full.appendSlice(gpa, header) catch {
+        std.debug.print("FAIL|oom\n", .{});
+        return;
+    };
+    full.appendSlice(gpa, body) catch {
+        std.debug.print("FAIL|oom\n", .{});
+        return;
+    };
 
     const peer_meta = Metadata.decode(full.items, password, gpa) catch |e| {
         std.debug.print("FAIL|decode|{}\n", .{e});

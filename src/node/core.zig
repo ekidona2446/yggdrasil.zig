@@ -529,6 +529,129 @@ pub const Core = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Admin/inspection surface
+//
+// These mirror the accessors the reference Go node exposes through
+// `core/api.go` (`GetSelf`/`GetPeers`/`GetTree`/`GetPaths`/`GetSessions`) so
+// the admin API can answer the same questions with the same data. They are
+// deliberately allocation-based (caller frees) because they are called from
+// the admin socket, i.e. at human speed, not on the packet path.
+// ---------------------------------------------------------------------------
+
+/// `core.SelfInfo`.
+pub const SelfInfo = struct {
+    key: PublicKey,
+    routing_entries: u64,
+};
+
+pub fn getSelfInfo(self: *Core) SelfInfo {
+    return .{
+        .key = self.selfKey(),
+        // ironwood's `Debug.GetSelf().RoutingEntries` is the number of tree
+        // entries currently in the routing table.
+        .routing_entries = @intCast(self.router.infos.count()),
+    };
+}
+
+/// `core.TreeEntryInfo`.
+pub const TreeEntryInfo = struct {
+    key: PublicKey,
+    parent: PublicKey,
+    sequence: u64,
+};
+
+/// All tree entries known to the router, in arbitrary order (the admin layer
+/// sorts them the way the reference implementation does).
+pub fn getTreeInfo(self: *Core, gpa: std.mem.Allocator) ![]TreeEntryInfo {
+    var list = std.ArrayListUnmanaged(TreeEntryInfo).empty;
+    errdefer list.deinit(gpa);
+    var it = self.router.infos.iterator();
+    while (it.next()) |entry| {
+        try list.append(gpa, .{
+            .key = entry.key_ptr.*,
+            .parent = entry.value_ptr.parent,
+            .sequence = entry.value_ptr.seq,
+        });
+    }
+    return list.toOwnedSlice(gpa);
+}
+
+/// `core.PathEntryInfo`.
+pub const PathEntryInfo = struct {
+    key: PublicKey,
+    path: []wire.PeerPort,
+    sequence: u64,
+};
+
+pub fn freePathEntryList(gpa: std.mem.Allocator, list: []PathEntryInfo) void {
+    for (list) |*p| gpa.free(p.path);
+    gpa.free(list);
+}
+
+/// Paths established through the pathfinder (dest -> coordinates, seq).
+pub fn getPathsInfo(self: *Core, gpa: std.mem.Allocator) ![]PathEntryInfo {
+    var list = std.ArrayListUnmanaged(PathEntryInfo).empty;
+    errdefer list.deinit(gpa);
+    var it = self.router.pathfinder.paths.iterator();
+    while (it.next()) |entry| {
+        const info = entry.value_ptr;
+        if (info.path.len == 0) continue; // no usable coordinates
+        const copy = try gpa.alloc(wire.PeerPort, info.path.len);
+        errdefer gpa.free(copy);
+        @memcpy(copy, info.path);
+        try list.append(gpa, .{
+            .key = entry.key_ptr.*,
+            .path = copy,
+            .sequence = info.seq,
+        });
+    }
+    return list.toOwnedSlice(gpa);
+}
+
+/// `core.SessionInfo` (one per established encryption session).
+pub const SessionInfo = encrypted.session.SessionSnapshot;
+
+pub fn getSessions(self: *Core) ![]SessionInfo {
+    return self.sessions.getAllSessions();
+}
+
+/// `core.PeerInfo` fields that live in the router/peers layer (everything
+/// except link-level stats such as URI, byte counters and uptime, which the
+/// network layer fills in -- see `NetworkManager.getPeersInfo`).
+pub const RouterPeerInfo = struct {
+    peer_id: PeerId,
+    key: PublicKey,
+    port: wire.PeerPort,
+    priority: u8,
+    cost: u64,
+    latency_ns: u64,
+};
+
+pub fn getRouterPeers(self: *Core, gpa: std.mem.Allocator) ![]RouterPeerInfo {
+    var list = std.ArrayListUnmanaged(RouterPeerInfo).empty;
+    errdefer list.deinit(gpa);
+    var pit = self.router.peers.valueIterator();
+    while (pit.next()) |pmap| {
+        var mit = pmap.iterator();
+        while (mit.next()) |entry| {
+            const pe = entry.value_ptr;
+            list.append(gpa, .{
+                .peer_id = pe.id,
+                .key = pe.key,
+                .port = pe.port,
+                .priority = pe.prio,
+                .cost = self.router.getCost(pe.id),
+                .latency_ns = self.router.getLatency(pe.id),
+            }) catch |err| {
+                list.deinit(gpa);
+                return err;
+            };
+        }
+    }
+    return list.toOwnedSlice(gpa);
+}
+
 /// Free a list of outgoing frames along with their data.
 pub fn freeFrameList(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(OutgoingFrame)) void {
     for (list.items) |f| gpa.free(f.data);

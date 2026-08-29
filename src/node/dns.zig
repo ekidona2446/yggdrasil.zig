@@ -133,7 +133,7 @@ pub fn resolve(gpa: std.mem.Allocator, host: []const u8, port: u16) ![]std.Io.ne
         }
     }
 
-	if (list.items.len == 0) {
+    if (list.items.len == 0) {
         list.deinit(gpa);
         return ResolveError.NoAddresses;
     }

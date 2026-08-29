@@ -71,13 +71,10 @@ pub const Peers = struct {
         self.next_id += 1;
 
         const port = if (self.handles.getPtr(key)) |existing|
-            if (existing.count() > 0)
-                blk: {
-                    var iter = existing.iterator();
-                    break :blk iter.next().?.value_ptr.port;
-                }
-            else
-                try self.allocPort()
+            if (existing.count() > 0) blk: {
+                var iter = existing.iterator();
+                break :blk iter.next().?.value_ptr.port;
+            } else try self.allocPort()
         else
             try self.allocPort();
 

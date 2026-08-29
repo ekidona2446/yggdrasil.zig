@@ -469,7 +469,10 @@ fn decryptOutsideLock(snap: *const RecvSnapshot, msg: []const u8, gpa: Allocator
     const encrypted = msg[snap.encrypted_offset..];
     const unboxed = boxOpenPrecomputed(encrypted, snap.nonce, &snap.shared, gpa) catch return error.SendInit;
     errdefer gpa.free(unboxed);
-    if (unboxed.len < 32) { gpa.free(unboxed); return error.Drop; }
+    if (unboxed.len < 32) {
+        gpa.free(unboxed);
+        return error.Drop;
+    }
     var inner_key: CurvePublicKey = undefined;
     @memcpy(&inner_key, unboxed[0..32]);
     const data = try gpa.alloc(u8, unboxed.len - 32);
@@ -529,7 +532,10 @@ pub const SessionManager = struct {
     ) ![]OutAction {
         if (data.len == 0) return &[_]OutAction{};
         var actions = std.ArrayListUnmanaged(OutAction).empty;
-        errdefer { for (actions.items) |*a| a.deinit(self.gpa); actions.deinit(self.gpa); }
+        errdefer {
+            for (actions.items) |*a| a.deinit(self.gpa);
+            actions.deinit(self.gpa);
+        }
 
         switch (data[0]) {
             SESSION_TYPE_INIT, SESSION_TYPE_ACK => {
@@ -549,7 +555,10 @@ pub const SessionManager = struct {
         our_ed_kp: *const Crypto,
     ) ![]OutAction {
         var actions = std.ArrayListUnmanaged(OutAction).empty;
-        errdefer { for (actions.items) |*a| a.deinit(self.gpa); actions.deinit(self.gpa); }
+        errdefer {
+            for (actions.items) |*a| a.deinit(self.gpa);
+            actions.deinit(self.gpa);
+        }
 
         if (self.sessions.getPtr(dest.*)) |session| {
             const encrypted = session.doSend(msg, self.gpa) catch |err| {
@@ -685,7 +694,9 @@ pub const SessionManager = struct {
                     to_remove.append(self.gpa, entry.key_ptr.*) catch {};
             }
         }
-        for (to_remove.items) |k| { _ = self.sessions.remove(k); }
+        for (to_remove.items) |k| {
+            _ = self.sessions.remove(k);
+        }
 
         to_remove.clearRetainingCapacity();
         {
@@ -696,7 +707,10 @@ pub const SessionManager = struct {
             }
         }
         for (to_remove.items) |k| {
-            if (self.buffers.fetchRemove(k)) |kv| { var buf = kv.value; buf.deinit(self.gpa); }
+            if (self.buffers.fetchRemove(k)) |kv| {
+                var buf = kv.value;
+                buf.deinit(self.gpa);
+            }
         }
     }
 

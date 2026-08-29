@@ -256,6 +256,11 @@ pub const Router = struct {
     // Latency tracking.
     lags: KeyMap(PeerId, u64) = .{}, // nanoseconds
     sig_req_times: KeyMap(PeerId, Instant) = .{},
+    /// The raw sig_req -> sig_res interval of the last verified response, kept
+    /// separately from `lags` because the admin API reports that measurement
+    /// (`peer.srrt.Sub(peer.srst)` in ironwood) rather than the smoothed value
+    /// the cost function uses.
+    last_rtts: KeyMap(PeerId, u64) = .{},
 
     // Signature protocol.
     requests: KeyMap(PublicKey, SigReqState) = .{},
@@ -321,6 +326,7 @@ pub const Router = struct {
 
         self.lags.deinit(self.gpa);
         self.sig_req_times.deinit(self.gpa);
+        self.last_rtts.deinit(self.gpa);
         self.requests.deinit(self.gpa);
         self.responses.deinit(self.gpa);
         self.responded.deinit(self.gpa);
@@ -467,6 +473,12 @@ pub const Router = struct {
         return dist;
     }
 
+    /// Last measured round trip to a peer in nanoseconds, 0 when the peer has not
+    /// answered a signature request yet.
+    pub fn getLatency(self: *const Router, peer_id: PeerId) u64 {
+        return self.last_rtts.get(peer_id) orelse 0;
+    }
+
     pub fn getCost(self: *const Router, peer_id: PeerId) u64 {
         const lag = self.lags.get(peer_id) orelse UNKNOWN_LATENCY_NS;
         const c = lag / std.time.ns_per_ms;
@@ -495,6 +507,10 @@ pub const Router = struct {
     pub fn handleResponse(self: *Router, peer_id: PeerId, key: *const PublicKey, res: *const wire.SigRes) Allocator.Error!void {
         const req_match = if (self.requests.getPtr(key.*)) |r| (r.seq == res.seq and r.nonce == res.nonce) else false;
         const rtt: u64 = if (self.sig_req_times.getPtr(peer_id)) |t| t.elapsedNanos() else 0;
+        // Ironwood stores the observed interval on the peer itself before handing
+        // the response to the router, so it is kept even when the sequence number
+        // does not match the request we have outstanding.
+        try self.last_rtts.put(self.gpa, peer_id, rtt);
 
         if (!self.responses.contains(key.*) and req_match) {
             self.res_seq_ctr += 1;
@@ -862,23 +878,33 @@ pub const Router = struct {
             }
             const bp = best_peer.?;
             if (std.mem.eql(u8, &p.key, &bp.key) and p.prio < bp.prio) {
-                best_peer = p; best_cost = cost; best_dist = dist;
+                best_peer = p;
+                best_cost = cost;
+                best_dist = dist;
             } else if (std.mem.eql(u8, &p.key, &bp.key) and p.prio > bp.prio) {
                 continue;
             } else if (saturatingMul(cost, dist) < saturatingMul(best_cost, best_dist)) {
-                best_peer = p; best_cost = cost; best_dist = dist;
+                best_peer = p;
+                best_cost = cost;
+                best_dist = dist;
             } else if (saturatingMul(cost, dist) > saturatingMul(best_cost, best_dist)) {
                 continue;
             } else if (dist < best_dist) {
-                best_peer = p; best_cost = cost; best_dist = dist;
+                best_peer = p;
+                best_cost = cost;
+                best_dist = dist;
             } else if (dist > best_dist) {
                 continue;
             } else if (cost < best_cost) {
-                best_peer = p; best_cost = cost; best_dist = dist;
+                best_peer = p;
+                best_cost = cost;
+                best_dist = dist;
             } else if (cost > best_cost) {
                 continue;
             } else if (p.order < bp.order) {
-                best_peer = p; best_cost = cost; best_dist = dist;
+                best_peer = p;
+                best_cost = cost;
+                best_dist = dist;
             }
         }
         if (best_peer) |p| return p.id;
@@ -1265,6 +1291,7 @@ pub const Router = struct {
         _ = self.lags.remove(peer_id);
         _ = self.responded.remove(peer_id);
         _ = self.sig_req_times.remove(peer_id);
+        _ = self.last_rtts.remove(peer_id);
 
         if (self.peers.getPtr(key)) |peers| {
             _ = peers.remove(peer_id);

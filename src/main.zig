@@ -183,7 +183,7 @@ pub fn main(init: std.process.Init) !void {
     var rwc = try ReadWriteCloser.init(gpa, &core, mtu);
     defer rwc.deinit();
 
-    var app = App{ .gpa = gpa, .net = &net, .rwc = &rwc, .tun = null };
+    var app = App{ .gpa = gpa, .net = &net, .rwc = &rwc, .tun = null, .tun_adapter = null };
     net.on_deliver = App.onDeliverTrampoline;
     net.on_deliver_ud = &app;
     net.on_discover = App.onDiscoverTrampoline;
@@ -201,7 +201,7 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("[ygg] warning: failed to assign TUN address ({}); configure manually\n", .{err});
             };
             var name_buf = t.interfaceName();
-			std.debug.print("status: tun device '{s}' up\n", .{std.mem.sliceTo(&name_buf, 0)});
+            std.debug.print("status: tun device '{s}' up\n", .{std.mem.sliceTo(&name_buf, 0)});
         }
     } else {
         std.debug.print("status: tun disabled (--tun none)\n", .{});
@@ -211,9 +211,10 @@ pub fn main(init: std.process.Init) !void {
     if (tun_adapter) |*t| {
         tun_io = try TunIo.init(gpa, &app, &loop, t);
         app.tun = &tun_io.?;
+        app.tun_adapter = t;
         tun_io.?.start(&loop);
     }
-	defer if (tun_io) |*t| t.deinit();
+    defer if (tun_io) |*t| t.deinit();
 
     // -- Peers / listeners ------------------------------------------------
     for (effective_peers.items) |peer_uri| {
@@ -227,8 +228,21 @@ pub fn main(init: std.process.Init) !void {
         };
     }
 
-    if (admin_listen.len > 0) {
-        std.debug.print("status: admin socket configured for {s} (not yet wired up)\n", .{admin_listen});
+    // -- Admin socket ---------------------------------------------------
+    // The handler runs on the loop thread (see admin_server.zig), which is what
+    // makes `addPeer`/`removePeer` safe: they mutate the dial table and arm
+    // libxev timers, neither of which may happen on another thread.
+    var admin_socket = node.admin.AdminSocket.init(gpa, &core);
+    admin_socket.net = &net;
+    admin_socket.hooks = .{ .ctx = &app, .tun = App.adminTunInfo };
+    var admin_server = node.admin_server.Server.init(gpa, &loop, &admin_socket);
+    defer admin_server.deinit();
+    if (admin_listen.len == 0 or std.mem.eql(u8, admin_listen, "none")) {
+        std.debug.print("status: admin socket disabled\n", .{});
+    } else if (admin_server.start(admin_listen)) |_| {
+        std.debug.print("status: admin socket on {s}\n", .{admin_listen});
+    } else |err| {
+        std.debug.print("[ygg] warning: admin socket {s} unavailable ({}); yggdrasilctl will not work\n", .{ admin_listen, err });
     }
 
     std.debug.print("status: running (press Ctrl+C to stop)\n", .{});
@@ -357,6 +371,22 @@ const App = struct {
     net: *NetworkManager,
     rwc: *ReadWriteCloser,
     tun: ?*TunIo,
+    /// Kept separately from `tun` because `getTun`'s reply needs the adapter's
+    /// name and MTU, which are the same on every platform while `TunIo` is not.
+    tun_adapter: ?*TunAdapter = null,
+
+    /// `admin.getTun`: the reference reports `enabled` always and `name`/`mtu`
+    /// only while the device exists (`GetTUNResponse`'s `omitempty` tags).
+    fn adminTunInfo(ctx: *anyopaque, out: *std.Io.Writer) node.admin.AdminError!void {
+        const app: *App = @ptrCast(@alignCast(ctx));
+        const t = app.tun_adapter orelse {
+            out.writeAll("{\"enabled\":false}") catch return error.WriteFailed;
+            return;
+        };
+        var name_buf = t.interfaceName();
+        const name = std.mem.sliceTo(&name_buf, 0);
+        out.print("{{\"enabled\":true,\"name\":\"{s}\",\"mtu\":{d}}}", .{ name, t.mtu }) catch return error.WriteFailed;
+    }
 
     fn onDeliverTrampoline(ud: ?*anyopaque, source: *const ironwood.PublicKey, data: []const u8) void {
         std.debug.print("[ygg] delivered {d} bytes from {x}\n", .{ data.len, source.* });
@@ -393,8 +423,8 @@ const App = struct {
 ///     its own background thread pumping `WintunReceivePacket` into a
 ///     queue, and wakes us via `xev.Async` each time it delivers a packet.
 const TunIo = switch (builtin.os.tag) {
-	.windows => TunIoWindows,
-	else => TunIoUnix,
+    .windows => TunIoWindows,
+    else => TunIoUnix,
 };
 
 const TunIoUnix = struct {
@@ -404,30 +434,30 @@ const TunIoUnix = struct {
     read_buf: [TUN_READ_BUF_SIZE]u8 = undefined,
     read_completion: xev.Completion = undefined,
     /// Only sets up fields; does not arm the first read. The read callback
-	/// needs a stable `*TunIoUnix` pointer, which isn't available until the
-	/// returned value is placed in its final (caller-owned) storage
-	/// location -- call `start` on that final pointer afterwards.
-	fn init(gpa: std.mem.Allocator, app: *App, loop: *xev.Loop, adapter: *TunAdapter) !TunIoUnix {
-		_ = gpa;
-		_ = loop;
-		return .{
-			.app = app,
-			.adapter = adapter,
-			.file = xev.File.initFd(adapter.native.pollHandle()),
-		};
-	}
+    /// needs a stable `*TunIoUnix` pointer, which isn't available until the
+    /// returned value is placed in its final (caller-owned) storage
+    /// location -- call `start` on that final pointer afterwards.
+    fn init(gpa: std.mem.Allocator, app: *App, loop: *xev.Loop, adapter: *TunAdapter) !TunIoUnix {
+        _ = gpa;
+        _ = loop;
+        return .{
+            .app = app,
+            .adapter = adapter,
+            .file = xev.File.initFd(adapter.native.pollHandle()),
+        };
+    }
 
-	/// Arms the first read. Must be called with `self` at its final,
-	/// stable storage address (see `init`'s doc comment).
-	fn start(self: *TunIoUnix, loop: *xev.Loop) void {
-		self.armRead(loop);
-	}
+    /// Arms the first read. Must be called with `self` at its final,
+    /// stable storage address (see `init`'s doc comment).
+    fn start(self: *TunIoUnix, loop: *xev.Loop) void {
+        self.armRead(loop);
+    }
 
-	fn armRead(self: *TunIoUnix, loop: *xev.Loop) void {
-		self.file.read(loop, &self.read_completion, .{ .slice = &self.read_buf }, TunIoUnix, self, onRead);
-	}
+    fn armRead(self: *TunIoUnix, loop: *xev.Loop) void {
+        self.file.read(loop, &self.read_completion, .{ .slice = &self.read_buf }, TunIoUnix, self, onRead);
+    }
 
-	fn onRead(ud: ?*TunIoUnix, loop: *xev.Loop, c: *xev.Completion, file: xev.File, buf: xev.ReadBuffer, r: xev.ReadError!usize) xev.CallbackAction {
+    fn onRead(ud: ?*TunIoUnix, loop: *xev.Loop, c: *xev.Completion, file: xev.File, buf: xev.ReadBuffer, r: xev.ReadError!usize) xev.CallbackAction {
         _ = c;
         _ = file;
         const self = ud.?;
@@ -458,13 +488,13 @@ const TunIoUnix = struct {
         _ = try self.adapter.write(data);
     }
 
-	fn deinit(self: *TunIoUnix) void {
-		_ = self;
-	}
+    fn deinit(self: *TunIoUnix) void {
+        _ = self;
+    }
 };
 
 const TunIoWindows = struct {
-	app: *App,
+    app: *App,
     adapter: *TunAdapter,
     gpa: std.mem.Allocator,
     queue: node.tun.WindowsRecvQueue,
@@ -522,7 +552,7 @@ const TunIoWindows = struct {
 
     fn deinit(self: *TunIoWindows) void {
         self.wake.deinit();
-     }
+    }
 };
 // ---------------------------------------------------------------------------
 // CLI parsing
@@ -600,8 +630,8 @@ fn printUsage() void {
         \\      --logto FILE|stdout  Log destination (default: stdout)
         \\
         \\Peer URI schemes: tcp://host:port, tls://host:port,
-		\\ ws://host:port[/path], wss://host:port[/path],
-		\\ quic://host:port. Query: ?key=HEX&password=PW&priority=N.
+        \\ ws://host:port[/path], wss://host:port[/path],
+        \\ quic://host:port. Query: ?key=HEX&password=PW&priority=N.
         \\
     , .{});
 }
@@ -609,7 +639,7 @@ fn printUsage() void {
 fn parseArgs(gpa: std.mem.Allocator, raw_args: std.process.Args) !Cli {
     var cli = Cli{};
     var args = try std.process.Args.Iterator.initAllocator(raw_args, gpa);
-	defer args.deinit();
+    defer args.deinit();
     _ = args.next();
 
     while (args.next()) |arg| {

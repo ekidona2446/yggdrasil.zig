@@ -80,7 +80,9 @@ pub const Firewall = struct {
         self.table.deinit(self.gpa);
     }
 
-    pub fn enabled(self: *const Firewall) bool { return self.enable; }
+    pub fn enabled(self: *const Firewall) bool {
+        return self.enable;
+    }
 
     pub fn gc(self: *Firewall) void {
         const now = monotonicNs();
@@ -141,7 +143,9 @@ pub const Firewall = struct {
     }
 };
 
-fn isTracked(proto: u8) bool { return proto == PROTO_TCP or proto == PROTO_UDP or proto == PROTO_ICMPV6; }
+fn isTracked(proto: u8) bool {
+    return proto == PROTO_TCP or proto == PROTO_UDP or proto == PROTO_ICMPV6;
+}
 
 fn advanceTcp(prev: ?TcpState, flags: u8) ?TcpState {
     if (flags & TCP_FLAG_RST != 0) return .closed;
@@ -229,7 +233,11 @@ fn parseIPv6(s: []const u8, out: *[16]u8) bool {
     var compression: ?usize = null;
     while (i < s.len) {
         if (s[i] == ':') {
-            if (i + 1 < s.len and s[i + 1] == ':') { compression = gi; i += 2; continue; }
+            if (i + 1 < s.len and s[i + 1] == ':') {
+                compression = gi;
+                i += 2;
+                continue;
+            }
             i += 1;
             gi += 1;
             if (gi > 7) return false;
@@ -249,7 +257,9 @@ fn parseIPv6(s: []const u8, out: *[16]u8) bool {
             if (j == 0) break;
             j -= 1;
         }
-        while (j >= comp) : (j -= 1) { groups[j] = 0; }
+        while (j >= comp) : (j -= 1) {
+            groups[j] = 0;
+        }
     }
     for (groups, 0..) |g, idx| {
         out[idx * 2] = @truncate(g >> 8);

@@ -23,8 +23,8 @@ pub fn createClient(gpa: std.mem.Allocator, host: []const u8, port: u16) !*io.Cl
         .port = port,
         // quic-go / yggdrasil-go tls.Config has empty NextProtos; advertising a
         // made-up token makes the server abort in Initial with a 45-byte close/ack.
-		// MinTLSVersion = 1.2,
-		// MaxTLSVersion = 1.3,
+        // MinTLSVersion = 1.2,
+        // MaxTLSVersion = 1.3,
         .alpn = null,
         .raw_application_streams = true,
         .urls = &.{},

@@ -156,7 +156,6 @@ test "handshake success" {
     try testing.expectEqualSlices(u8, &id_b.public_key, &decoded_b.public_key);
 }
 
-
 fn stripPath(hostport: []const u8) struct { hp: []const u8, path: []const u8 } {
     if (std.mem.indexOfScalar(u8, hostport, '/')) |s| {
         const path = hostport[s..];
