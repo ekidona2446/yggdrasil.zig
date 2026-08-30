@@ -16,9 +16,12 @@ pub const tls_wolfssl = @import("tls_wolfssl.zig");
 pub const ws = @import("ws.zig");
 pub const quic = @import("quic.zig");
 pub const multicast = @import("multicast.zig");
+pub const ckr = @import("ckr.zig");
+pub const ckr_routes = @import("ckr_routes.zig");
 pub const tun = @import("tun.zig");
 pub const dns = @import("dns.zig");
 pub const network = @import("network.zig");
+pub const unix_socket = @import("unix_socket.zig");
 
 pub const Address = address.Address;
 pub const Subnet = address.Subnet;
@@ -41,7 +44,9 @@ test {
     _ = tls;
     _ = tls_wolfssl;
     _ = multicast;
+    _ = ckr;
     _ = tun;
     _ = dns;
     _ = network;
+    _ = unix_socket;
 }

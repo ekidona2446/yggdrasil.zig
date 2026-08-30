@@ -22,6 +22,19 @@ pub const KEY_STORE_TIMEOUT_NS: u64 = 120 * std.time.ns_per_s;
 
 const IPV6_HEADER_LEN: usize = 40;
 
+/// The bits of an IP address, right-aligned in a `u128` (IPv4 in the low 32
+/// bits), for CKR route-table lookups.
+fn addrBits(bytes: [16]u8, is_ip6: bool) u128 {
+    if (is_ip6) {
+        var v: u128 = 0;
+        for (bytes) |b| v = (v << 8) | b;
+        return v;
+    }
+    var v: u32 = 0;
+    for (bytes[12..16]) |b| v = (v << 8) | b;
+    return v;
+}
+
 // ---------------------------------------------------------------------------
 // KeyInfo — cached address/subnet for a known key
 // ---------------------------------------------------------------------------
@@ -62,6 +75,10 @@ pub const ReadWriteCloser = struct {
     mtu: u64,
     firewall: ?*Firewall,
     gpa: std.mem.Allocator,
+    /// Crypto-Key Routing table (borrowed; owned by the caller). When set,
+    /// the RWC tunnels arbitrary IPv4/IPv6 subnets in addition to native
+    /// Yggdrasil IPv6.
+    ckr: ?*const node.ckr.CkrTable = null,
 
     pub fn init(gpa: std.mem.Allocator, core: *Core, mtu: u64) !ReadWriteCloser {
         return .{
@@ -98,6 +115,11 @@ pub const ReadWriteCloser = struct {
         self.firewall = fw;
     }
 
+    /// Set an optional Crypto-Key Routing table (enables CKR tunneling).
+    pub fn setCkr(self: *ReadWriteCloser, ckr: *const node.ckr.CkrTable) void {
+        self.ckr = ckr;
+    }
+
     // -------------------------------------------------------------------
     // Outbound: TUN packet -> mesh
     // -------------------------------------------------------------------
@@ -108,20 +130,61 @@ pub const ReadWriteCloser = struct {
     /// (e.g. via `NetworkManager.flushFrames`). Caller owns and must free
     /// the returned slice with `node.core.freeFrames`.
     pub fn handleOutbound(self: *ReadWriteCloser, packet: []const u8) ![]node.core.OutgoingFrame {
+        if (packet.len == 0) return &[_]node.core.OutgoingFrame{};
+        const is_ip4 = packet[0] & 0xf0 == 0x40;
+        const is_ip6 = packet[0] & 0xf0 == 0x60;
+
+        // Firewall: observe outbound IPv6 flows (outbound is never blocked).
+        if (self.firewall) |fw| {
+            if (fw.enabled() and is_ip6) fw.observeOutbound(packet);
+        }
+
+        if (self.ckr) |ckr| {
+            if (!is_ip4 and !is_ip6) return &[_]node.core.OutgoingFrame{};
+            if (is_ip4 and packet.len < 20) return &[_]node.core.OutgoingFrame{};
+            if (is_ip6 and packet.len < IPV6_HEADER_LEN) return &[_]node.core.OutgoingFrame{};
+            return self.ckrWrite(ckr, packet, is_ip4, is_ip6);
+        }
+
         if (packet.len < IPV6_HEADER_LEN) return &[_]node.core.OutgoingFrame{};
-        if (packet[0] & 0xf0 != 0x60) return &[_]node.core.OutgoingFrame{}; // not IPv6
+        if (!is_ip6) return &[_]node.core.OutgoingFrame{}; // not IPv6
 
         const dst_bytes: [16]u8 = packet[24..40].*;
-        var dst_addr = Address{ .bytes = dst_bytes };
-        var dst_subnet = Subnet{ .bytes = dst_bytes[0..8].* };
+        const dst_addr = Address{ .bytes = dst_bytes };
+        const dst_subnet = Subnet{ .bytes = dst_bytes[0..8].* };
 
         if (dst_addr.isValid()) {
             return self.sendToAddress(dst_addr, packet);
         } else if (dst_subnet.isValid()) {
             return self.sendToSubnet(dst_subnet, packet);
         }
-        _ = &dst_addr;
-        _ = &dst_subnet;
+        return &[_]node.core.OutgoingFrame{};
+    }
+
+    /// CKR outbound routing: route a TUN packet to the mapped node. Native
+    /// Yggdrasil IPv6 destinations take the standard lookup path first; other
+    /// destinations go through the CKR table, and anything unmatched is
+    /// silently dropped (matching the reference).
+    fn ckrWrite(self: *ReadWriteCloser, ckr: *const node.ckr.CkrTable, packet: []const u8, is_ip4: bool, is_ip6: bool) ![]node.core.OutgoingFrame {
+        var dst_bytes: [16]u8 = undefined;
+        if (is_ip4) {
+            dst_bytes = [_]u8{0} ** 16;
+            @memcpy(dst_bytes[12..16], packet[16..20]);
+        } else {
+            dst_bytes = packet[24..40].*;
+        }
+
+        if (is_ip6 and ckr.yggdrasil_routing) {
+            const dst_addr = Address{ .bytes = dst_bytes };
+            const dst_subnet = Subnet{ .bytes = dst_bytes[0..8].* };
+            if (dst_addr.isValid()) return self.sendToAddress(dst_addr, packet);
+            if (dst_subnet.isValid()) return self.sendToSubnet(dst_subnet, packet);
+        }
+
+        const bits = addrBits(dst_bytes, is_ip6);
+        if (ckr.getKeyForAddress(is_ip6, bits)) |key| {
+            return self.core.writeTo(&key, packet, node.core.TYPE_SESSION_TRAFFIC);
+        }
         return &[_]node.core.OutgoingFrame{};
     }
 
@@ -224,11 +287,19 @@ pub const ReadWriteCloser = struct {
     /// (a view into `payload`, sans the type byte) to write to TUN, or null
     /// to drop.
     pub fn handleInbound(self: *ReadWriteCloser, source: *const PublicKey, payload: []const u8) ?[]const u8 {
-        _ = self;
-        _ = self;
         if (payload.len < 1) return null;
         if (payload[0] != node.core.TYPE_SESSION_TRAFFIC) return null;
         const pkt = payload[1..];
+        if (pkt.len == 0) return null;
+
+        if (self.ckr) |ckr| {
+            if (!self.ckrReadValidate(ckr, pkt, source)) return null;
+            if (self.firewall) |fw| {
+                if (fw.enabled() and (pkt[0] & 0xf0 == 0x60) and !fw.checkInbound(pkt)) return null;
+            }
+            return pkt;
+        }
+
         if (pkt.len < IPV6_HEADER_LEN) return null;
         if (pkt[0] & 0xf0 != 0x60) return null; // not IPv6
 
@@ -241,7 +312,46 @@ pub const ReadWriteCloser = struct {
         {
             return null;
         }
+
+        if (self.firewall) |fw| {
+            if (fw.enabled() and !fw.checkInbound(pkt)) return null;
+        }
         return pkt;
+    }
+
+    /// CKR inbound validation: native Yggdrasil IPv6 sources must match the
+    /// sender's key; other sources must match the key their CKR route maps to.
+    fn ckrReadValidate(self: *ReadWriteCloser, ckr: *const node.ckr.CkrTable, pkt: []const u8, source: *const PublicKey) bool {
+        _ = self;
+        const is_ip4 = pkt[0] & 0xf0 == 0x40;
+        const is_ip6 = pkt[0] & 0xf0 == 0x60;
+        if (!is_ip4 and !is_ip6) return false;
+        if (is_ip4 and pkt.len < 20) return false;
+        if (is_ip6 and pkt.len < IPV6_HEADER_LEN) return false;
+
+        if (is_ip6 and ckr.yggdrasil_routing) {
+            const src_bytes: [16]u8 = pkt[8..24].*;
+            const expected_addr = node.addrForKey(source);
+            const expected_subnet = node.subnetForKey(source);
+            if (std.mem.eql(u8, &src_bytes, &expected_addr.bytes) or
+                std.mem.eql(u8, src_bytes[0..8], &expected_subnet.bytes))
+            {
+                return true;
+            }
+        }
+
+        var src_bytes: [16]u8 = undefined;
+        if (is_ip4) {
+            src_bytes = [_]u8{0} ** 16;
+            @memcpy(src_bytes[12..16], pkt[12..16]);
+        } else {
+            src_bytes = pkt[8..24].*;
+        }
+        const bits = addrBits(src_bytes, is_ip6);
+        if (ckr.getKeyForAddress(is_ip6, bits)) |expected_key| {
+            return std.mem.eql(u8, &expected_key, source);
+        }
+        return false;
     }
 
     /// Build an ICMPv6 Packet Too Big message.

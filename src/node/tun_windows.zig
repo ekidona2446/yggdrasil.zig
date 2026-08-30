@@ -335,6 +335,14 @@ pub fn assignAddress(tun: *NativeTun, addr: node.Address, mtu: u16) !void {
     try createUnicastAddress(luid, addr);
 }
 
+/// CKR tunnel addresses (arbitrary IPv4/IPv6 CIDR). Not yet wired to the
+/// IP Helper API (`CreateUnicastIpAddressEntry`); reports an error.
+pub fn assignCidrAddress(tun: *NativeTun, cidr: []const u8) !void {
+    _ = tun;
+    _ = cidr;
+    return error.TunNotSupportedOnThisPlatform;
+}
+
 // ---------------------------------------------------------------------------
 // IP Helper API (iphlpapi.dll): CreateUnicastIpAddressEntry
 // ---------------------------------------------------------------------------

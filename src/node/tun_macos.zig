@@ -268,6 +268,61 @@ fn setMtuAndUp(ifname: []const u8, mtu: u16) !void {
     _ = ioctl(sock4, SIOCSIFFLAGS, &ifr_flags);
 }
 
+/// Assign an arbitrary IPv4/IPv6 CIDR address to a utun interface (CKR
+/// tunnel addresses). IPv6 uses SIOCAIFADDR_IN6; IPv4 uses SIOCSIFADDR.
+pub fn assignCidrAddress(ifname: []const u8, cidr: []const u8) !void {
+    const trunc_len = @min(ifname.len, IFNAMSIZ - 1);
+
+    var addr_text = cidr;
+    var prefix: u32 = 0;
+    var has_prefix = false;
+    if (std.mem.indexOfScalar(u8, cidr, '/')) |slash| {
+        addr_text = cidr[0..slash];
+        prefix = std.fmt.parseInt(u32, cidr[slash + 1 ..], 10) catch return error.BadCidr;
+        has_prefix = true;
+    }
+
+    if (std.mem.indexOfScalar(u8, addr_text, ':') != null) {
+        const ip6 = std.Io.net.Ip6Address.parse(addr_text, 0) catch return error.BadCidr;
+        if (!has_prefix) prefix = 128;
+        const sock6 = socket(AF_INET6, SOCK_DGRAM, 0);
+        if (sock6 < 0) return error.SocketFailed;
+        defer _ = close(sock6);
+        var req = in6_aliasreq{};
+        @memcpy(req.ifra_name[0..trunc_len], ifname[0..trunc_len]);
+        req.ifra_addr = .{ .sin6_addr = ip6.bytes };
+        // Prefix mask: top `prefix` bits set.
+        var mask_bytes: [16]u8 = [_]u8{0} ** 16;
+        var p = prefix;
+        for (&mask_bytes) |*b| {
+            if (p >= 8) {
+                b.* = 0xff;
+                p -= 8;
+            } else {
+                b.* = @as(u8, 0xff) << @intCast(8 - p);
+                p = 0;
+            }
+        }
+        req.ifra_prefixmask = .{ .sin6_addr = mask_bytes };
+        if (ioctl(sock6, SIOCAIFADDR_IN6, @intFromPtr(&req)) != 0) return error.SetAddrFailed;
+        return;
+    }
+
+    const ip4 = std.Io.net.Ip4Address.parse(addr_text, 0) catch return error.BadCidr;
+    if (!has_prefix) prefix = 32;
+    const sock4 = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock4 < 0) return error.SocketFailed;
+    defer _ = close(sock4);
+    var req = ifreq{};
+    @memcpy(req.ifr_name[0..trunc_len], ifname[0..trunc_len]);
+    // `ifr_ifru.addr` is a `sockaddr` (family u8 + len u8 + data...).
+    req.ifr_ifru.addr[0] = @intCast(AF_INET); // sin_len
+    req.ifr_ifru.addr[1] = @intCast(AF_INET); // sin_family
+    @memcpy(req.ifr_ifru.addr[4..8], &ip4.bytes);
+    const SIOCSIFADDR: c_ulong = ioc(IOC_IN, 'i', 19, @sizeOf(ifreq));
+    if (ioctl(sock4, SIOCSIFADDR, @intFromPtr(&req)) != 0) return error.SetAddrFailed;
+}
+
 /// Assign the Yggdrasil IPv6 address (with /7 "network" visibility, matching
 /// the reference implementation's use of a broad on-link prefix) to the given
 /// utun interface, and bring it up. Requires root (kernel control sockets

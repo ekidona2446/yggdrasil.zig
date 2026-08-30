@@ -1,19 +1,94 @@
 //! LAN multicast peer discovery.
 //!
 //! Sends and receives BLAKE2b-authenticated advertisements on
-//! ff02::114:9001 to discover Yggdrasil peers on the local network.
+//! ff02::114:9001 to discover Yggdrasil peers on the local network, mirroring
+//! yggdrasil-go's `src/multicast`. The beacon announces our TLS listener on
+//! each configured interface; the listener receives beacons, verifies their
+//! auth hash, and auto-peers with the sender.
+//!
+//! The wire format is:
+//!   major_version u16be | minor_version u16be | public_key [32] | port u16be
+//!   | hash_len u16be | hash [hash_len]
+//! where `hash = BLAKE2b-512(public_key, key=password)`.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const xev = @import("xev");
 const ironwood = @import("ironwood");
 const node = @import("node.zig");
 
+const c = std.c;
 const PublicKey = ironwood.PublicKey;
 const Metadata = node.version.Metadata;
+const NetworkManager = node.network.NetworkManager;
 
 pub const MULTICAST_GROUP: [16]u8 = .{ 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x14 };
 pub const MULTICAST_PORT: u16 = 9001;
 pub const BEACON_MAX_INTERVAL_NS: u64 = 15 * std.time.ns_per_s;
 const RECV_BUF_SIZE: usize = 2048;
+/// How often the driver wakes to drain beacons / decide whether to announce.
+const TICK_MS: u64 = 250;
+
+const timemod = @import("util").time;
+
+// ---------------------------------------------------------------------------
+// Platform primitives (IPv6 multicast sockets + interface enumeration).
+// These are POSIX concepts (`getifaddrs`, `ipv6_mreq`, `IPV6_JOIN_GROUP`);
+// the constants differ per OS, so they're dispatched on `builtin.os.tag`.
+// ---------------------------------------------------------------------------
+
+const IFF_UP: c_uint = 0x1;
+const IFF_LOOPBACK: c_uint = 0x8;
+const IFF_POINTOPOINT: c_uint = 0x10;
+const IFF_RUNNING: c_uint = 0x40;
+const IFF_MULTICAST: c_uint = switch (builtin.os.tag) {
+    .linux, .windows => 0x1000,
+    // macOS / BSD use a different bit for IFF_MULTICAST.
+    .macos, .ios, .maccatalyst, .tvos, .visionos, .watchos,
+    .freebsd, .netbsd, .openbsd, .dragonfly, .illumos,
+    => 0x8000,
+    else => 0x1000,
+};
+
+/// `struct ipv6_mreq { struct in6_addr ipv6mr_multiaddr; unsigned int ipv6mr_interface; }`.
+const ipv6_mreq = extern struct {
+    multiaddr: [16]u8,
+    interface: c_uint,
+};
+
+/// `IPV6_JOIN_GROUP` (Linux; a.k.a. `IPV6_ADD_MEMBERSHIP` on BSD/macOS/Windows).
+const IPV6_JOIN_GROUP: u32 = switch (builtin.os.tag) {
+    .linux => 20,
+    .windows, .macos, .ios, .maccatalyst, .tvos, .visionos, .watchos,
+    .freebsd, .netbsd, .openbsd, .dragonfly, .illumos,
+    => 12,
+    else => 20,
+};
+
+/// `struct sockaddr_in6` in the Linux/BSD/Windows layout (`sin6_family` first).
+/// macOS's native struct leads with a `sin6_len` byte; that variant is not
+/// handled here (the multicast driver is exercised on Linux).
+const SockaddrIn6 = extern struct {
+    family: u16,
+    port: u16, // network byte order
+    flowinfo: u32,
+    addr: [16]u8,
+    scope_id: u32,
+};
+
+const AF_INET6: u16 = 10;
+
+const IfAddrs = extern struct {
+    ifa_next: ?*IfAddrs,
+    ifa_name: [*:0]u8,
+    ifa_flags: c_uint,
+    ifa_addr: ?*c.sockaddr,
+    ifa_netmask: ?*c.sockaddr,
+    ifa_ifu: ?*c.sockaddr,
+    ifa_data: ?*anyopaque,
+};
+extern "c" fn getifaddrs(ifap: *?*IfAddrs) c_int;
+extern "c" fn freeifaddrs(ifa: *IfAddrs) void;
 
 /// A received advertisement.
 pub const Advertisement = struct {
@@ -62,6 +137,402 @@ pub fn computeAuthHash(public_key: *const PublicKey, password: []const u8, gpa: 
     return out;
 }
 
+/// Simple glob match (`*` wildcards only) — the reference uses a full regexp,
+/// but the overwhelmingly common filters are `"*"`, `"eth0"`, `"eth.*"`.
+fn globMatch(pattern: []const u8, name: []const u8) bool {
+    var p: usize = 0;
+    var n: usize = 0;
+    var star: ?usize = null;
+    var star_n: usize = 0;
+    while (n < name.len) {
+        if (p < pattern.len and (pattern[p] == '?' or pattern[p] == name[n])) {
+            p += 1;
+            n += 1;
+        } else if (p < pattern.len and pattern[p] == '*') {
+            star = p;
+            p += 1;
+            star_n = n;
+        } else if (star) |sp| {
+            p = sp + 1;
+            star_n += 1;
+            n = star_n;
+        } else {
+            return false;
+        }
+    }
+    while (p < pattern.len and pattern[p] == '*') p += 1;
+    return p == pattern.len;
+}
+
+fn isLinkLocal(addr: *const [16]u8) bool {
+    return addr[0] == 0xfe and (addr[1] & 0xc0) == 0x80;
+}
+
+// ---------------------------------------------------------------------------
+// The multicast driver
+// ---------------------------------------------------------------------------
+
+pub const Multicast = struct {
+    gpa: std.mem.Allocator,
+    loop: *xev.Loop,
+    net: *NetworkManager,
+    our_key: PublicKey,
+    /// Config entries (slices borrow the config object; never freed here).
+    config: []const node.config.MulticastInterfaceConfig,
+
+    sock: c_int = -1,
+    running: bool = false,
+    timer: xev.Timer,
+    timer_c: xev.Completion = undefined,
+    next_announce_ns: u64 = 0,
+
+    /// Discovered/selected interfaces (owned).
+    interfaces: std.ArrayListUnmanaged(IfInfo) = .empty,
+    /// The beacon listener's actual bound port (0 = no beacon listener yet).
+    beacon_port: u16 = 0,
+    /// URI of the beacon listener we created (owned; null until created).
+    beacon_uri: ?[]u8 = null,
+
+    const IfInfo = struct {
+        name: []u8, // owned
+        index: u32,
+        addr: [16]u8, // link-local IPv6
+        beacon: bool,
+        listen: bool,
+        port: u16,
+        priority: u8,
+        password: []u8, // owned copy
+        hash: [64]u8,
+
+        fn deinit(self: *IfInfo, gpa: std.mem.Allocator) void {
+            gpa.free(self.name);
+            gpa.free(self.password);
+        }
+    };
+
+    pub fn init(gpa: std.mem.Allocator, loop: *xev.Loop, net: *NetworkManager, our_key: PublicKey, config: []const node.config.MulticastInterfaceConfig) !Multicast {
+        return .{ .gpa = gpa, .loop = loop, .net = net, .our_key = our_key, .config = config, .timer = try xev.Timer.init() };
+    }
+
+    pub fn deinit(self: *Multicast) void {
+        self.stop();
+        for (self.interfaces.items) |*i| i.deinit(self.gpa);
+        self.interfaces.deinit(self.gpa);
+        if (self.beacon_uri) |u| self.gpa.free(u);
+        self.beacon_uri = null;
+        self.timer.deinit();
+    }
+
+    /// Open the socket, join the multicast groups, and start the driver timer.
+    pub fn start(self: *Multicast) !void {
+        if (self.running) return;
+        const fd = c.socket(c.AF.INET6, c.SOCK.DGRAM | c.SOCK.CLOEXEC, 0);
+        if (fd < 0) return error.SocketFailed;
+        self.sock = fd;
+
+        // SO_REUSEADDR (+ SO_REUSEPORT where available) so several nodes can
+        // share the well-known group address on the same host.
+        var one: c_int = 1;
+        _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.REUSEADDR, &one, @sizeOf(c_int));
+        if (@hasDecl(c.SO, "REUSEPORT")) {
+            _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.REUSEPORT, &one, @sizeOf(c_int));
+        }
+
+        var bind_addr = SockaddrIn6{
+            .family = AF_INET6,
+            .port = std.mem.nativeToBig(u16, MULTICAST_PORT),
+            .flowinfo = 0,
+            .addr = [_]u8{0} ** 16,
+            .scope_id = 0,
+        };
+        if (c.bind(fd, @ptrCast(&bind_addr), @sizeOf(SockaddrIn6)) != 0) {
+            _ = c.close(fd);
+            self.sock = -1;
+            return error.BindFailed;
+        }
+
+        self.running = true;
+        self.refreshInterfaces();
+        self.timer.run(self.loop, &self.timer_c, TICK_MS, Multicast, self, onTick);
+        self.next_announce_ns = 0; // announce immediately on first tick
+    }
+
+    pub fn stop(self: *Multicast) void {
+        if (!self.running) return;
+        self.running = false;
+        if (self.sock >= 0) {
+            _ = c.close(self.sock);
+            self.sock = -1;
+        }
+    }
+
+    fn onTick(ud: ?*Multicast, loop: *xev.Loop, cc: *xev.Completion, r: xev.Timer.RunError!void) xev.CallbackAction {
+        _ = r catch {};
+        const self = ud.?;
+        if (!self.running) return .disarm;
+        self.drain();
+        self.maybeAnnounce();
+        self.timer.run(loop, cc, TICK_MS, Multicast, self, onTick);
+        return .disarm;
+    }
+
+    /// Non-blocking drain of received beacons.
+    fn drain(self: *Multicast) void {
+        var buf: [RECV_BUF_SIZE]u8 = undefined;
+        while (true) {
+            var from = SockaddrIn6{ .family = 0, .port = 0, .flowinfo = 0, .addr = undefined, .scope_id = 0 };
+            var from_len: c.socklen_t = @sizeOf(SockaddrIn6);
+            const n: isize = std.posix.system.recvfrom(
+                self.sock,
+                buf[0..].ptr,
+                buf.len,
+                std.posix.MSG.DONTWAIT,
+                @ptrCast(&from),
+                &from_len,
+            );
+            if (n <= 0) break;
+            self.handleBeacon(buf[0..@intCast(n)], &from);
+        }
+    }
+
+    fn handleBeacon(self: *Multicast, data: []const u8, from: *const SockaddrIn6) void {
+        const adv = Advertisement.decode(data, self.gpa) catch return;
+        defer self.gpa.free(adv.hash);
+        if (adv.major_version != node.version.PROTOCOL_VERSION_MAJOR) return;
+        if (adv.minor_version != node.version.PROTOCOL_VERSION_MINOR) return;
+        if (std.mem.eql(u8, &adv.public_key, &self.our_key)) return;
+
+        // Which interface did this arrive on? The scope id of the source
+        // address is the receiving interface index on Linux/macOS/BSD.
+        const info = self.findInterface(from.scope_id, adv.public_key, adv.hash) orelse return;
+
+        var addr_buf: [48]u8 = undefined;
+        var w = std.Io.Writer.fixed(&addr_buf);
+        node.address.formatIpv6(&from.addr, &w) catch return;
+        const addr_text = addr_buf[0..w.end];
+
+        var key_hex: [64]u8 = undefined;
+        const hx = "0123456789abcdef";
+        for (adv.public_key, 0..) |b, i| {
+            key_hex[i * 2] = hx[(b >> 4) & 0xF];
+            key_hex[i * 2 + 1] = hx[b & 0xF];
+        }
+        // Numeric scope id so the link-local dial is routed on the interface
+        // the beacon arrived on.
+        var uri_buf: [256]u8 = undefined;
+        const uri = std.fmt.bufPrint(&uri_buf, "tls://[{s}%{d}]:{d}?key={s}&priority={d}&password={s}", .{
+            addr_text, from.scope_id, adv.port, key_hex, info.priority, info.password,
+        }) catch return;
+        std.debug.print("[ygg] multicast discovered peer {s}\n", .{uri});
+        self.net.addOutboundPeer(uri, .{}) catch |err| {
+            std.debug.print("[ygg] multicast peer dial failed: {}\n", .{err});
+        };
+    }
+
+    /// Find the interface entry matching the receiving index and verify the
+    /// auth hash against that entry's password.
+    fn findInterface(self: *Multicast, idx: u32, key: PublicKey, hash: []const u8) ?*IfInfo {
+        for (self.interfaces.items) |*info| {
+            if (info.index != idx or !info.listen) continue;
+            var computed: [64]u8 = undefined;
+            if (info.password.len == 0) {
+                std.crypto.hash.blake2.Blake2b512.hash(&key, &computed, .{});
+            } else {
+                std.crypto.hash.blake2.Blake2b512.hash(&key, &computed, .{ .key = info.password });
+            }
+            if (std.mem.eql(u8, &computed, hash)) return info;
+        }
+        return null;
+    }
+
+    fn maybeAnnounce(self: *Multicast) void {
+        const now = timemod.monotonicNanos();
+        if (now < self.next_announce_ns) return;
+        // Re-scan interfaces each announce (interfaces come and go).
+        self.refreshInterfaces();
+        self.announce() catch |err| {
+            std.debug.print("[ygg] multicast announce error: {}\n", .{err});
+        };
+        // ~1s + up to ~1s of jitter, like the reference.
+        self.next_announce_ns = now + std.time.ns_per_s + (now % std.time.ns_per_s);
+    }
+
+    /// (Re)enumerate the set of interfaces we multicast on, joining the group
+    /// on every `listen` interface.
+    fn refreshInterfaces(self: *Multicast) void {
+        for (self.interfaces.items) |*i| i.deinit(self.gpa);
+        self.interfaces.clearRetainingCapacity();
+
+        var head: ?*IfAddrs = null;
+        if (getifaddrs(&head) != 0) return;
+        defer if (head) |h| freeifaddrs(h);
+
+        var cur = head;
+        while (cur) |ifa| : (cur = ifa.ifa_next) {
+            const name = std.mem.span(ifa.ifa_name);
+            if (ifa.ifa_addr == null) continue;
+            const sa = ifa.ifa_addr.?;
+            if (sa.family != AF_INET6) continue;
+            const sin6: *align(1) const SockaddrIn6 = @ptrCast(ifa.ifa_addr.?);
+            if (!isLinkLocal(&sin6.addr)) continue;
+
+            // Interface must be up, running, multicast-capable, non-P2P.
+            if (ifa.ifa_flags & IFF_UP == 0) continue;
+            if (ifa.ifa_flags & IFF_RUNNING == 0) continue;
+            if (ifa.ifa_flags & IFF_MULTICAST == 0) continue;
+            if (ifa.ifa_flags & IFF_POINTOPOINT != 0) continue;
+
+            // Match against config (first matching entry wins, like the ref).
+            var cfg: ?*const node.config.MulticastInterfaceConfig = null;
+            for (self.config) |*mc| {
+                if (!mc.beacon and !mc.listen) continue;
+                if (globMatch(mc.filter, name)) {
+                    cfg = mc;
+                    break;
+                }
+            }
+            const mc = cfg orelse continue;
+
+            const raw_idx = c.if_nametoindex(ifa.ifa_name);
+            if (raw_idx <= 0) continue;
+            const idx: u32 = @intCast(raw_idx);
+            var hash: [64]u8 = undefined;
+            if (mc.password.len == 0) {
+                std.crypto.hash.blake2.Blake2b512.hash(&self.our_key, &hash, .{});
+            } else {
+                std.crypto.hash.blake2.Blake2b512.hash(&self.our_key, &hash, .{ .key = mc.password });
+            }
+
+            const name_dup = self.gpa.dupe(u8, name) catch continue;
+            const pw_dup = self.gpa.dupe(u8, mc.password) catch {
+                self.gpa.free(name_dup);
+                continue;
+            };
+            self.interfaces.append(self.gpa, .{
+                .name = name_dup,
+                .index = idx,
+                .addr = sin6.addr,
+                .beacon = mc.beacon,
+                .listen = mc.listen,
+                .port = mc.port,
+                .priority = mc.priority,
+                .password = pw_dup,
+                .hash = hash,
+            }) catch {
+                self.gpa.free(name_dup);
+                self.gpa.free(pw_dup);
+                continue;
+            };
+
+            if (mc.listen) self.joinGroup(idx);
+        }
+    }
+
+    fn joinGroup(self: *Multicast, idx: u32) void {
+        var mreq = ipv6_mreq{ .multiaddr = MULTICAST_GROUP, .interface = idx };
+        _ = c.setsockopt(self.sock, c.IPPROTO.IPV6, IPV6_JOIN_GROUP, &mreq, @sizeOf(ipv6_mreq));
+    }
+
+    /// Ensure a beacon listener exists and send our advertisement on every
+    /// beacon interface.
+    fn announce(self: *Multicast) !void {
+        var any_beacon = false;
+        for (self.interfaces.items) |*info| {
+            if (info.beacon) {
+                any_beacon = true;
+                break;
+            }
+        }
+        if (!any_beacon) return;
+
+        // Create the beacon listener once. Bound to [::] (all interfaces); the
+        // reference binds per-interface link-local addresses, but a wildcard
+        // listener accepts the dials peers make to our link-local address too.
+        if (self.beacon_uri == null) {
+            const first = for (self.interfaces.items) |*info| {
+                if (info.beacon) break info;
+            } else return;
+            var uri_buf: [128]u8 = undefined;
+            const uri = try std.fmt.bufPrint(&uri_buf, "tls://[::]:{d}?priority={d}&password={s}", .{
+                first.port, first.priority, first.password,
+            });
+            const bound = self.net.addListener(uri) catch |err| {
+                std.debug.print("[ygg] multicast beacon listener failed: {}\n", .{err});
+                return;
+            };
+            self.beacon_port = if (bound != 0) bound else first.port;
+            self.beacon_uri = try self.gpa.dupe(u8, uri);
+        }
+
+        const port = self.beacon_port;
+        for (self.interfaces.items) |*info| {
+            if (!info.beacon) continue;
+            const adv = Advertisement{
+                .major_version = node.version.PROTOCOL_VERSION_MAJOR,
+                .minor_version = node.version.PROTOCOL_VERSION_MINOR,
+                .public_key = self.our_key,
+                .port = port,
+                .hash = &info.hash,
+            };
+            const msg = try adv.encode(self.gpa);
+            defer self.gpa.free(msg);
+            var dest = SockaddrIn6{
+                .family = AF_INET6,
+                .port = std.mem.nativeToBig(u16, MULTICAST_PORT),
+                .flowinfo = 0,
+                .addr = MULTICAST_GROUP,
+                .scope_id = info.index,
+            };
+            _ = std.posix.system.sendto(self.sock, msg.ptr, msg.len, 0, @ptrCast(&dest), @sizeOf(SockaddrIn6));
+        }
+    }
+
+    /// Write the admin `getMulticastInterfaces` JSON body directly, mirroring
+    /// Go's `GetMulticastInterfacesResponse` (interfaces sorted stably by name).
+    pub fn writeAdminJson(self: *Multicast, w: *std.Io.Writer) !void {
+        // Collect interface pointers and sort them by name.
+        const gpa = self.gpa;
+        const ptrs = try gpa.alloc(*const IfInfo, self.interfaces.items.len);
+        defer gpa.free(ptrs);
+        for (self.interfaces.items, 0..) |*info, i| ptrs[i] = info;
+        std.mem.sort(*const IfInfo, ptrs, {}, struct {
+            fn lessThan(_: void, a: *const IfInfo, b: *const IfInfo) bool {
+                return std.mem.lessThan(u8, a.name, b.name);
+            }
+        }.lessThan);
+
+        try w.writeAll("{\"multicast_interfaces\":[");
+        for (ptrs, 0..) |info, i| {
+            if (i != 0) try w.writeAll(",");
+            // address: the per-interface TLS listener is bound to
+            // `[fe80::...%ifname]:port` (Go's `listener.Addr().String()`), or "-".
+            try w.writeAll("{\"name\":");
+            try node.admin.writeJsonString(w, info.name);
+            try w.writeAll(",\"address\":");
+            if (self.beacon_port != 0 and info.beacon) {
+                var ipbuf: [48]u8 = undefined;
+                var iw = std.Io.Writer.fixed(&ipbuf);
+                if (node.address.formatIpv6(&info.addr, &iw)) |_| {
+                    var buf: [96]u8 = undefined;
+                    if (std.fmt.bufPrint(&buf, "[{s}%{s}]:{d}", .{ ipbuf[0..iw.end], info.name, self.beacon_port })) |s| {
+                        try node.admin.writeJsonString(w, s);
+                    } else |_| {
+                        try node.admin.writeJsonString(w, "-");
+                    }
+                } else |_| {
+                    try node.admin.writeJsonString(w, "-");
+                }
+            } else {
+                try node.admin.writeJsonString(w, "-");
+            }
+            try w.print(",\"beacon\":{},\"listen\":{},\"password\":{}}}", .{
+                info.beacon, info.listen, info.password.len > 0,
+            });
+        }
+        try w.writeAll("]}");
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -90,4 +561,22 @@ test "advertisement encode decode" {
     defer gpa.free(decoded.hash);
     try testing.expectEqualSlices(u8, &key, &decoded.public_key);
     try testing.expectEqual(@as(u16, 9001), decoded.port);
+}
+
+test "glob match" {
+    try testing.expect(globMatch("*", "eth0"));
+    try testing.expect(globMatch("eth0", "eth0"));
+    try testing.expect(!globMatch("eth0", "eth1"));
+    try testing.expect(globMatch("eth*", "eth0"));
+    try testing.expect(globMatch("e?h0", "eth0"));
+    try testing.expect(globMatch("*.0", "eth1.0"));
+    try testing.expect(!globMatch("*.0", "eth0"));
+    try testing.expect(!globMatch("wlan*", "eth0"));
+}
+
+test "link local detection" {
+    const fe80 = [_]u8{ 0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    const global = [_]u8{ 0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    try testing.expect(isLinkLocal(&fe80));
+    try testing.expect(!isLinkLocal(&global));
 }

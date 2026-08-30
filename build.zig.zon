@@ -10,8 +10,7 @@
         },
         .wolfssl = .{
             .url = "https://github.com/wolfSSL/wolfssl/archive/refs/heads/master.tar.gz",
-            .hash = "N-V-__8AAEcuQwZQc5wna7xrVZ3lQkpswP5dmmVn2Wjb-iM3",
-            .lazy = true,
+            .hash = "N-V-__8AAGfgxAnHn-UyUHYPCfY9v6f7R1R17aVi88Xj3kSG",
         },
         .wintun = .{
             .url = "https://www.wintun.net/builds/wintun-0.14.1.zip",
@@ -19,17 +18,18 @@
             .lazy = true,
         },
         .zquic = .{
-            .url = "https://github.com/ch4r10t33r/zquic/archive/refs/tags/v1.7.86.tar.gz",
-            .hash = "zquic-1.7.86-2zRc1I2dGQAI1M0gg19eycqe5WRZwvwJx97CECAhYreO",
+            .url = "https://github.com/zigstack/zquic/archive/refs/heads/master.tar.gz",
+			.hash = "zquic-1.7.86-2zRc1I2dGQAI1M0gg19eycqe5WRZwvwJx97CECAhYreO"
         },
         .libwebsockets = .{
             .url = "https://github.com/warmcat/libwebsockets/archive/refs/heads/main.tar.gz",
-            .hash = "N-V-__8AAJfYgAJGb-qg_3seex9gwI_WOq86TbjEXERIzFCT",
+            .hash = "N-V-__8AAPTNeAQqu8ldwiCJPY7Yb5ayB5VnX76kruIcyS_8",
         },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
+        "vendor",
     },
 }

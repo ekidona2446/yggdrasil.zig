@@ -15,10 +15,10 @@
 //! socket, the way it does for other optional subsystems.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const xev = @import("xev");
 const node = @import("node.zig");
 const dns = @import("dns.zig");
+const unix_socket = @import("unix_socket.zig");
 
 const admin = node.admin;
 const log = std.log.scoped(.admin);
@@ -74,7 +74,11 @@ fn parseAdminUri(uri: []const u8) ParseUriError!Target {
 /// close, so this is only for paths where the loop is already stopped (shutdown)
 /// or the object never got one; elsewhere `Client.close` is used instead.
 fn closeSocket(tcp: xev.TCP) void {
-    if (builtin.os.tag == .linux) _ = std.os.linux.close(tcp.fd);
+    // Portable close: `std.posix.system.close` resolves to libc's `close` on
+    // every POSIX target (the node always links libc), and to the raw Linux
+    // syscall on a no-libc Linux build. The previous `std.os.linux.close`
+    // was Linux-only and silently leaked the descriptor on macOS/*BSD.
+    _ = std.posix.system.close(tcp.fd);
 }
 
 pub const Server = struct {
@@ -85,25 +89,59 @@ pub const Server = struct {
     accept_completion: xev.Completion = .{},
     clients: std.ArrayListUnmanaged(*Client) = .empty,
     listening: bool = false,
+    /// Set for a `unix://` listener so the socket file can be unlinked on
+    /// shutdown. Null for `tcp://` (and for abstract unix sockets, which have
+    /// no filesystem entry to clean up).
+    unix_path: ?[]const u8 = null,
 
     pub fn init(gpa: std.mem.Allocator, loop: *xev.Loop, adm: *admin.AdminSocket) Server {
         return .{ .gpa = gpa, .loop = loop, .admin = adm };
     }
 
-    /// Bind `uri` (e.g. `tcp://localhost:9001`) and start accepting. The error set
-    /// is inferred: besides the URI-level refusals of `parseAdminUri`, binding and
-    /// listening fail with whatever the platform and libxev report, and `main` only
-    /// ever logs that.
+    /// Bind `uri` (e.g. `tcp://localhost:9001` or `unix:///var/run/yggdrasil.sock`)
+    /// and start accepting. The error set is inferred: besides the URI-level
+    /// refusals of `parseAdminUri`, binding and listening fail with whatever the
+    /// platform and libxev report, and `main` only ever logs that.
     pub fn start(self: *Server, uri: []const u8) !void {
         const target = parseAdminUri(uri) catch |err| switch (err) {
             error.UnsupportedScheme => return err,
             else => return error.BadAdminURI,
         };
-        const host_port = switch (target) {
-            .unix => return error.UnixSocketsNotSupported,
-            .tcp => |v| v,
-        };
+        switch (target) {
+            .unix => |path| try self.startUnix(path),
+            .tcp => |host_port| try self.startTcp(host_port),
+        }
+    }
 
+    fn startUnix(self: *Server, path: []const u8) !void {
+        const addr = unix_socket.Address.init(path) catch return error.BadAdminURI;
+        // A leftover socket file from a previous run is removed, but only if
+        // nothing is listening on it (mirrors yggdrasil-go's behaviour).
+        unix_socket.cleanupStale(addr);
+        self.tcp = unix_socket.listener(addr, 128) catch |err| {
+            log.warn("unix admin socket listen failed: {}", .{err});
+            return switch (err) {
+                error.AddressInUse => error.AddressInUse,
+                error.NameTooLong => error.BadAdminURI,
+                else => error.SystemResources,
+            };
+        };
+        errdefer closeSocket(self.tcp);
+        if (!addr.abstract) {
+            self.unix_path = try self.gpa.dupe(u8, addr.path);
+            // Restrict the socket file like yggdrasil-go does (0660): only the
+            // owner and group may talk to the admin socket.
+            var buf: [108]u8 = undefined;
+            if (std.fmt.bufPrintZ(&buf, "{s}", .{addr.path})) |z| {
+                _ = std.posix.system.chmod(z.ptr, 0o660);
+            } else |_| {}
+        }
+        self.tcp.accept(self.loop, &self.accept_completion, Server, self, onAccept);
+        self.listening = true;
+        log.info("unix admin socket listening on {s}", .{path});
+    }
+
+    fn startTcp(self: *Server, host_port: anytype) !void {
         const addrs = dns.resolve(self.gpa, host_port.host, host_port.port) catch return error.ResolveFailed;
         defer self.gpa.free(addrs);
         if (addrs.len == 0) return error.NoSuitableIPs;
@@ -130,6 +168,15 @@ pub const Server = struct {
         self.clients.deinit(self.gpa);
         if (self.listening) closeSocket(self.tcp);
         self.listening = false;
+        if (self.unix_path) |p| {
+            // Remove the socket file so the next run can bind again.
+            var buf: [108]u8 = undefined;
+            if (std.fmt.bufPrintZ(&buf, "{s}", .{p})) |z| {
+                _ = std.posix.system.unlink(z.ptr);
+            } else |_| {}
+            self.gpa.free(p);
+            self.unix_path = null;
+        }
     }
 
     fn onAccept(ud: ?*Server, loop: *xev.Loop, c: *xev.Completion, r: xev.AcceptError!xev.TCP) xev.CallbackAction {
@@ -380,9 +427,10 @@ test "admin server refuses a URI it cannot serve" {
     try testing.expectError(error.BadAdminURI, server.start("not a uri"));
     try testing.expectError(error.UnsupportedScheme, server.start("quic://127.0.0.1:1"));
     try testing.expectError(error.BadAdminURI, server.start("tcp://127.0.0.1:notaport"));
-    // Recognised, but not served yet: libxev's listener API is TCP-specific and
-    // `unix://` would need the raw-socket path the peer layer also lacks.
-    try testing.expectError(error.UnixSocketsNotSupported, server.start("unix:///tmp/admin.sock"));
+    // `unix://` is served: a listener is created on the path and cleaned up in
+    // `deinit` (the socket file is unlinked), so binding the same path twice in
+    // a row succeeds.
+    try server.start("unix:///tmp/ygg-admin-test.sock");
 
     // Address parsing, including the bracketed IPv6 form `yggdrasilctl` uses.
     const cases = [_]struct { uri: []const u8, host: []const u8, port: u16 }{

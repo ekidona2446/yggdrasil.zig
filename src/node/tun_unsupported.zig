@@ -40,3 +40,9 @@ pub fn assignAddress(ifname: []const u8, addr: node.Address, mtu: u16) !void {
     _ = mtu;
     return error.TunNotSupportedOnThisPlatform;
 }
+
+pub fn assignCidrAddress(ifname: []const u8, cidr: []const u8) !void {
+    _ = ifname;
+    _ = cidr;
+    return error.TunNotSupportedOnThisPlatform;
+}

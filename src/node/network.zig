@@ -14,6 +14,7 @@ const dns = @import("dns.zig");
 const tls_wolfssl = @import("tls_wolfssl.zig");
 const ws = @import("ws.zig");
 const quic_mod = @import("quic.zig");
+const unix_socket = @import("unix_socket.zig");
 
 const Core = node.core.Core;
 const Metadata = node.version.Metadata;
@@ -61,6 +62,8 @@ pub const LinkOptions = struct {
     use_ws: bool = false,
     /// QUIC/UDP instead of TCP (`quic://`).
     use_quic: bool = false,
+    /// Unix domain socket instead of TCP (`unix://`).
+    use_unix: bool = false,
     /// HTTP path for the WebSocket upgrade (default `/`).
     ws_path: []const u8 = "/",
     /// Host header / SNI name for WebSocket/TLS (not necessarily an IP).
@@ -219,6 +222,12 @@ pub fn parsePeerURI(uri: []const u8) LinkError!ParsedURI {
     if (!known_scheme) return error.UnknownScheme;
     const rest = uri[scheme_end + 3 ..];
     const addr_part = if (std.mem.indexOfScalar(u8, rest, '?')) |qpos| rest[0..qpos] else rest;
+    if (std.ascii.eqlIgnoreCase(scheme, "unix")) {
+        // `unix:///path/to.sock` / `unix://@abstract` have no `host:port`;
+        // the whole remainder is the socket path.
+        if (addr_part.len == 0) return error.InvalidURI;
+        return .{ .scheme = scheme, .host = addr_part, .port = 0, .path = "/" };
+    }
     const hp = try extractHostPort(addr_part);
     return .{ .scheme = scheme, .host = hp.host, .port = hp.port, .path = hp.path };
 }
@@ -386,6 +395,10 @@ const PeerConn = struct {
     /// QUIC session (null for TCP/TLS/WS). When set, socket I/O goes through
     /// zquic instead of `tcp`.
     quic: ?*QuicLink = null,
+    /// Inbound QUIC session (null except for accepted `quic://` listeners).
+    /// When set, socket I/O goes through the shared zquic `Server` instead of
+    /// `tcp`.
+    quic_srv: ?*QuicSrvConn = null,
 
     /// Destroy `self` iff we're closing and no slot has an outstanding
     /// completion anymore. Safe to call redundantly from multiple callback
@@ -468,6 +481,51 @@ const QuicLink = struct {
     closing: bool = false,
 };
 
+/// One accepted `quic://` inbound connection. The shared listener owns the UDP
+/// socket and drives zquic's `Server`; this struct ties the per-connection
+/// zquic `ConnState` (and its client-initiated raw-app stream) onto the same
+/// ironwood handshake/frame path used by TCP and outbound QUIC.
+const QuicSrvConn = struct {
+    manager: *NetworkManager,
+    conn: *PeerConn,
+    listener: *QuicServerListener,
+    server: *quic_mod.io.Server,
+    quic_conn: *quic_mod.io.ConnState,
+    stream_id: u64 = 0,
+    stream_found: bool = false,
+    send_off: u64 = 0,
+    recv_off: usize = 0,
+    closed: bool = false,
+};
+
+/// One `quic://` listener. Owns a zquic `Server` (bound UDP socket) plus a
+/// 20 ms drive tick, mirroring the outbound `QuicLink` pump. On every tick it
+/// drains the socket, drives zquic, promotes freshly handshaked conns to
+/// `PeerConn`s, and pumps raw-app STREAM bytes into the ironwood path.
+const QuicServerListener = struct {
+    manager: *NetworkManager,
+    server: *quic_mod.io.Server,
+    tick: xev.Timer,
+    tick_c: xev.Completion = undefined,
+    recv_scratch: [2048]u8 = undefined,
+    /// Listener link options (priority/password/pinned keys from the listen
+    /// URI); copied onto each accepted connection for the metadata handshake.
+    options: LinkOptions = .{},
+    /// Live accepted connections, keyed by the zquic `ConnState` pointer.
+    conns: std.ArrayListUnmanaged(*QuicSrvConn) = .empty,
+
+    fn deinit(self: *QuicServerListener, gpa: std.mem.Allocator) void {
+        for (self.conns.items) |srv| gpa.destroy(srv);
+        self.conns.deinit(gpa);
+        if (self.options.uri.len > 0) gpa.free(self.options.uri);
+        if (self.options.password.len > 0) gpa.free(self.options.password);
+        if (self.options.sintf.len > 0) gpa.free(self.options.sintf);
+        self.tick.deinit();
+        quic_mod.destroyServer(gpa, self.server);
+        gpa.destroy(self);
+    }
+};
+
 // ---------------------------------------------------------------------------
 // TLS state: shared wolfSSL contexts + our identity certificate
 // ---------------------------------------------------------------------------
@@ -489,6 +547,8 @@ pub const NetworkManager = struct {
     our_id: ironwood.Crypto,
     conns: std.DoublyLinkedList = .{},
     listeners: std.ArrayListUnmanaged(*ListenerState) = .empty,
+    /// `quic://` listeners (owned zquic Servers + their drive ticks).
+    quic_listeners: std.ArrayListUnmanaged(*QuicServerListener) = .empty,
     dials: std.ArrayListUnmanaged(*DialState) = .empty,
     /// Fired whenever a peer's session delivers a decrypted app payload.
     on_deliver: ?*const fn (ud: ?*anyopaque, source: *const PublicKey, data: []const u8) void = null,
@@ -542,6 +602,8 @@ pub const NetworkManager = struct {
     pub fn deinit(self: *NetworkManager) void {
         for (self.listeners.items) |l| l.deinit(self.gpa);
         self.listeners.deinit(self.gpa);
+        for (self.quic_listeners.items) |ql| ql.deinit(self.gpa);
+        self.quic_listeners.deinit(self.gpa);
         if (self.tls_state) |*s| {
             tls_wolfssl.freeCtx(s.client_ctx);
             tls_wolfssl.freeCtx(s.server_ctx);
@@ -611,6 +673,7 @@ pub const NetworkManager = struct {
         options.use_tls = std.mem.eql(u8, parsed.scheme, "tls") or std.mem.eql(u8, parsed.scheme, "wss");
         options.use_ws = std.mem.eql(u8, parsed.scheme, "ws") or std.mem.eql(u8, parsed.scheme, "wss");
         options.use_quic = std.mem.eql(u8, parsed.scheme, "quic");
+        options.use_unix = std.mem.eql(u8, parsed.scheme, "unix");
         options.ws_path = parsed.path;
         options.ws_host = parsed.host;
         options.uri = try normalizePeerUri(self.gpa, uri);
@@ -722,6 +785,28 @@ pub const NetworkManager = struct {
     fn attemptDial(self: *NetworkManager, dial: *DialState) void {
         _ = self;
         if (dial.cancelled) return;
+
+        if (dial.options.use_unix) {
+            // Unix domain socket: no DNS, and the connect completes
+            // synchronously (it's a local socket), so spawn the connection
+            // directly instead of going through an async connect completion.
+            const addr = unix_socket.Address.init(dial.host) catch |err| {
+                logInfo("unix://{s} bad path: {}", .{ dial.host, err });
+                scheduleRedial(dial);
+                return;
+            };
+            dial.tcp = unix_socket.dial(addr) catch |err| {
+                logInfo("unix://{s} connect failed: {}", .{ dial.host, err });
+                scheduleRedial(dial);
+                return;
+            };
+            dial.backoff_ns = MINIMUM_BACKOFF_NS;
+            dial.manager.spawnConn(dial.tcp, dial.options, dial) catch |err| {
+                logInfo("spawnConn failed: {}", .{err});
+            };
+            return;
+        }
+
         // Resolve on the calling thread. This blocks the event loop briefly,
         // which is acceptable for the modest number of configured peers a
         // Yggdrasil node typically has (a handful to a few dozen).
@@ -800,8 +885,67 @@ pub const NetworkManager = struct {
     /// The error set is inferred: besides `LinkError` (which is what an admin
     /// `listen` refusal would report) a listener can fail inside libxev or the
     /// resolver, and those codes are only ever logged by the caller at startup.
-    pub fn addListener(self: *NetworkManager, uri: []const u8) !void {
+    /// Returns the port actually bound (resolved from `getsockname`, so a
+    /// `:0` ephemeral listener reports its real port; 0 for `unix://`).
+    pub fn addListener(self: *NetworkManager, uri: []const u8) !u16 {
         const parsed = try parsePeerURI(uri);
+
+        // `wss://` listeners are not supported natively. The reference
+        // (`link_wss.go`) returns
+        //   "WSS listener not supported, use WS listener behind reverse proxy instead"
+        // and expects TLS termination to happen in a reverse proxy in front of
+        // a plain `ws://` listener. Dialing `wss://` peers still works (see
+        // `addOutboundPeer`).
+        if (std.mem.eql(u8, parsed.scheme, "wss")) return error.NotSupported;
+
+        var options = try parseLinkQuery(self.gpa, uri, .{
+            .use_tls = std.mem.eql(u8, parsed.scheme, "tls"),
+            .use_ws = std.mem.eql(u8, parsed.scheme, "ws"),
+            .use_quic = std.mem.eql(u8, parsed.scheme, "quic"),
+            .use_unix = std.mem.eql(u8, parsed.scheme, "unix"),
+            .ws_path = parsed.path,
+            .ws_host = parsed.host,
+        });
+        // Inbound links report their *remote* address as the URI (built in
+        // `tryParseHandshake`), so nothing is stored in `uri` here beyond the
+        // listener's own scheme/opts, which accepted connections inherit.
+        options.uri = try normalizePeerUri(self.gpa, uri);
+        errdefer self.gpa.free(options.uri);
+
+        if (options.use_quic) {
+            // QUIC listener: no TCP socket, no DNS. zquic's Server binds its
+            // own UDP socket on 0.0.0.0:port and we drive it with a timer.
+            try self.addQuicListener(options, parsed.port);
+            logInfo("quic listener started on 0.0.0.0:{d}", .{parsed.port});
+            return parsed.port;
+        }
+
+        if (options.use_unix) {
+            // Unix domain socket listener: no DNS, no host/port.
+            const addr = unix_socket.Address.init(parsed.host) catch return error.InvalidURI;
+            unix_socket.cleanupStale(addr);
+            const tcp = unix_socket.listener(addr, 128) catch |err| {
+                self.gpa.free(options.uri);
+                logInfo("unix://{s} listen failed: {}", .{ parsed.host, err });
+                return error.AddressInUse;
+            };
+            errdefer _ = std.posix.system.close(tcp.fd);
+            const listener = try self.gpa.create(ListenerState);
+            listener.* = .{
+                .manager = self,
+                .tcp = tcp,
+                .use_tls = options.use_tls,
+                .use_ws = options.use_ws,
+                .scheme = try self.gpa.dupe(u8, parsed.scheme),
+                .options = options,
+                .unix_path = if (addr.abstract) null else try self.gpa.dupe(u8, addr.path),
+            };
+            try self.listeners.append(self.gpa, listener);
+            listener.tcp.accept(self.loop, &listener.accept_completion, ListenerState, listener, onAccept);
+            logInfo("{s} listener started on {s}", .{ parsed.scheme, parsed.host });
+            return 0;
+        }
+
         // `LinkError` is the set the admin API reports, so resolver failures are
         // folded into it rather than leaking `dns`'s own error set to callers.
         const addrs = dns.resolve(self.gpa, parsed.host, parsed.port) catch |err| {
@@ -811,19 +955,6 @@ pub const NetworkManager = struct {
         defer self.gpa.free(addrs);
         if (addrs.len == 0) return error.NoSuitableIPs;
         const addr = addrs[0];
-
-        var options = try parseLinkQuery(self.gpa, uri, .{
-            .use_tls = std.mem.eql(u8, parsed.scheme, "tls") or std.mem.eql(u8, parsed.scheme, "wss"),
-            .use_ws = std.mem.eql(u8, parsed.scheme, "ws") or std.mem.eql(u8, parsed.scheme, "wss"),
-            .use_quic = std.mem.eql(u8, parsed.scheme, "quic"),
-            .ws_path = parsed.path,
-            .ws_host = parsed.host,
-        });
-        // Inbound links report their *remote* address as the URI (built in
-        // `tryParseHandshake`), so nothing is stored in `uri` here beyond the
-        // listener's own scheme/opts, which accepted connections inherit.
-        options.uri = try normalizePeerUri(self.gpa, uri);
-        errdefer self.gpa.free(options.uri);
 
         const listener = try self.gpa.create(ListenerState);
         listener.* = .{
@@ -839,6 +970,7 @@ pub const NetworkManager = struct {
         try self.listeners.append(self.gpa, listener);
         listener.tcp.accept(self.loop, &listener.accept_completion, ListenerState, listener, onAccept);
         logInfo("{s} listener started on {f} (tls={})", .{ parsed.scheme, addr, listener.use_tls });
+        return listenerBoundPort(listener.tcp);
     }
 
     fn onAccept(ud: ?*ListenerState, loop: *xev.Loop, c: *xev.Completion, r: xev.AcceptError!xev.TCP) xev.CallbackAction {
@@ -875,9 +1007,17 @@ pub const NetworkManager = struct {
             .use_ws = options.use_ws,
             .pending_options = options,
             .inbound = dial == null,
-            .uri = if (options.uri.len > 0) try self.gpa.dupe(u8, options.uri) else "",
+            // Inbound connections start with an empty `uri`; `spawnConn` fills
+            // it in from the peer's actual remote address once the handshake
+            // completes (see the `remoteAddrString` block below). Storing the
+            // *listener's* URI here would make `getPeers` report the wildcard
+            // listen address (e.g. `tls://[::]:0`) instead of the peer.
+            .uri = if (dial == null) "" else (if (options.uri.len > 0) try self.gpa.dupe(u8, options.uri) else ""),
         };
-        if (options.use_ws) {
+        if (options.use_ws and dial != null) {
+            // Outbound (client) side: we generate the Sec-WebSocket-Key and
+            // precompute the expected accept. Inbound (server) side derives
+            // the accept from the client's key once its upgrade arrives.
             ws.generateKey(&conn.ws_key_b64);
             ws.acceptKey(&conn.ws_key_b64, &conn.ws_accept_b64);
         }
@@ -894,8 +1034,12 @@ pub const NetworkManager = struct {
             // sent only once the TLS handshake itself completes (see
             // `pumpTlsHandshake`).
             try self.pumpTlsHandshake(conn, is_server);
-        } else if (options.use_ws) {
+        } else if (options.use_ws and dial != null) {
+            // Plain-WS outbound only: send the client upgrade request.
             try self.sendWsUpgrade(conn);
+        } else if (options.use_ws) {
+            // Plain-WS inbound (server): nothing to send until the client's
+            // upgrade request arrives (`unwrapWs` parses it and answers 101).
         } else {
             // Plain TCP: send our ironwood handshake metadata immediately;
             // queueWrite handles the async write via the same path used
@@ -932,8 +1076,12 @@ pub const NetworkManager = struct {
             .ok => {
                 if (tls.isHandshakeDone() and !conn.tls_handshake_done) {
                     conn.tls_handshake_done = true;
-                    if (conn.use_ws) {
+                    if (conn.use_ws and conn.dial != null) {
+                        // wss:// outbound: upgrade the now-encrypted channel.
                         try self.sendWsUpgrade(conn);
+                    } else if (conn.use_ws) {
+                        // wss:// inbound: nothing to send; await the client's
+                        // upgrade request, which arrives over the TLS channel.
                     } else {
                         const meta = Metadata.init(self.our_id.public_key, conn.pending_options.priority);
                         const msg = try meta.encode(&self.our_id, conn.pending_options.password, self.gpa);
@@ -1038,6 +1186,15 @@ pub const NetworkManager = struct {
         self.conns.remove(&conn.list_node);
         if (conn.quic) |link| {
             link.closing = true;
+            conn.close_active = false;
+            conn.maybeDestroy();
+            return;
+        }
+        if (conn.quic_srv) |srv| {
+            if (!srv.closed) {
+                srv.closed = true;
+                self.quicSrvRemove(srv);
+            }
             conn.close_active = false;
             conn.maybeDestroy();
             return;
@@ -1204,8 +1361,8 @@ pub const NetworkManager = struct {
         errdefer quic_mod.destroyClient(self.gpa, client);
         quic_mod.setPeerIpv4(client, octets, use_port);
         try quic_mod.startHandshake(client);
-        logInfo("quic://{s}:{d} Initial sent to {d}.{d}.{d}.{d} ({d} bytes on wire)", .{
-            host, use_port, octets[0], octets[1], octets[2], octets[3], client.conn.init_pn,
+        logInfo("quic://{s}:{d} Initial sent to {d}.{d}.{d}.{d}", .{
+            host, use_port, octets[0], octets[1], octets[2], octets[3],
         });
 
         const conn = try self.gpa.create(PeerConn);
@@ -1215,6 +1372,15 @@ pub const NetworkManager = struct {
             .tcp = undefined,
             .keepalive_timer = try xev.Timer.init(),
             .pending_options = options,
+            // QUIC outbound: set `uri` (and `inbound`) the same way `spawnConn`
+            // does for TCP, so `tryParseHandshake` does not misclassify this
+            // connection as inbound (which would call `getpeername` on the
+            // UDP socket) and `getPeers` reports the right `remote` URI.
+            // Ownership of `options.uri` transfers here: `addOutboundPeer`
+            // hands it over on the success path and `conn.destroy` frees it.
+            .dial = null,
+            .uri = options.uri,
+            .inbound = false,
         };
 
         const link = try self.gpa.create(QuicLink);
@@ -1238,16 +1404,21 @@ pub const NetworkManager = struct {
     }
 
     fn drainQuicUdp(_: *NetworkManager, link: *QuicLink) void {
+        // Portable non-blocking receive. The node always links libc (wolfSSL and
+        // libwebsockets), so `std.posix.system.recvfrom` resolves to libc's
+        // `recvfrom` on every POSIX target -- unlike the previous Linux-only
+        // `std.os.linux.recvfrom` syscall, which would not even compile on
+        // macOS/*BSD/Windows. `MSG_DONTWAIT` makes a datagram-less socket return
+        // immediately instead of stalling the event loop.
         while (true) {
-            const rc = std.os.linux.recvfrom(
+            const n: isize = std.posix.system.recvfrom(
                 link.client.sock,
-                &link.recv_scratch,
+                link.recv_scratch[0..].ptr,
                 link.recv_scratch.len,
-                std.os.linux.MSG.DONTWAIT,
+                std.posix.MSG.DONTWAIT,
                 null,
                 null,
             );
-            const n: isize = @bitCast(rc);
             if (n <= 0) break;
             link.client.feedPacket(link.recv_scratch[0..@intCast(n)]);
         }
@@ -1304,16 +1475,229 @@ pub const NetworkManager = struct {
         self.closeConn(link.conn);
     }
 
+    // -----------------------------------------------------------------
+    // QUIC listener (server side)
+    // -----------------------------------------------------------------
+
+    /// Start a `quic://` listener: create a zquic `Server` bound to
+    /// `0.0.0.0:port` and a 20 ms drive tick that drains/feeds its UDP socket
+    /// and pumps accepted connections. `options` (priority/password from the
+    /// listen URI) is taken by value; on success its heap slices are owned by
+    /// the listener, otherwise the caller's `errdefer` frees them.
+    fn addQuicListener(self: *NetworkManager, options: LinkOptions, port: u16) !void {
+        const server = try quic_mod.createServer(self.gpa, port);
+        errdefer quic_mod.destroyServer(self.gpa, server);
+
+        const listener = try self.gpa.create(QuicServerListener);
+        errdefer self.gpa.destroy(listener);
+        listener.* = .{
+            .manager = self,
+            .server = server,
+            .tick = try xev.Timer.init(),
+            .options = options,
+        };
+        try self.quic_listeners.append(self.gpa, listener);
+        listener.tick.run(self.loop, &listener.tick_c, 20, QuicServerListener, listener, onQuicSrvTick);
+    }
+
+    fn onQuicSrvTick(ud: ?*QuicServerListener, loop: *xev.Loop, c: *xev.Completion, r: xev.Timer.RunError!void) xev.CallbackAction {
+        _ = r catch {};
+        const listener = ud.?;
+        listener.manager.quicSrvDrive(listener);
+        if (listener.manager.stop) return .disarm;
+        listener.tick.run(loop, c, 20, QuicServerListener, listener, onQuicSrvTick);
+        return .disarm;
+    }
+
+    /// One listener drive: reset zquic's per-drive budgets, drain/feed UDP,
+    /// process pending work, promote newly handshaked conns, and pump existing
+    /// conns' raw-app streams into the ironwood path.
+    fn quicSrvDrive(self: *NetworkManager, listener: *QuicServerListener) void {
+        quic_mod.serverDrive(listener.server, &listener.recv_scratch);
+        self.quicSrvPromoteNew(listener);
+
+        var i: usize = 0;
+        while (i < listener.conns.items.len) {
+            const srv = listener.conns.items[i];
+            const before = listener.conns.items.len;
+            self.quicSrvPump(listener, srv);
+            // `quicSrvPump` may tear the conn down (removing it from the list
+            // via `quicSrvRemove` + `swapRemove`); only advance when the entry
+            // is still present at the same index.
+            if (listener.conns.items.len == before) i += 1;
+        }
+    }
+
+    /// Find freshly `.connected` zquic conns that we haven't wrapped in a
+    /// `PeerConn` yet and do so.
+    fn quicSrvPromoteNew(self: *NetworkManager, listener: *QuicServerListener) void {
+        for (&listener.server.conns) |*slot| {
+            const qconn = slot.* orelse continue;
+            if (qconn.phase != .connected) continue;
+            // Already promoted?
+            var seen = false;
+            for (listener.conns.items) |srv| {
+                if (srv.quic_conn == qconn) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+
+            const conn = self.gpa.create(PeerConn) catch continue;
+            conn.* = .{
+                .manager = self,
+                .tcp = undefined,
+                .keepalive_timer = xev.Timer.init() catch {
+                    self.gpa.destroy(conn);
+                    continue;
+                },
+                .pending_options = listener.options,
+                .inbound = true,
+                .uri = "",
+            };
+            const srv = self.gpa.create(QuicSrvConn) catch {
+                conn.keepalive_timer.deinit();
+                self.gpa.destroy(conn);
+                continue;
+            };
+            srv.* = .{
+                .manager = self,
+                .conn = conn,
+                .listener = listener,
+                .server = listener.server,
+                .quic_conn = qconn,
+            };
+            conn.quic_srv = srv;
+            self.conns.append(&conn.list_node);
+            listener.conns.append(self.gpa, srv) catch {
+                self.quicSrvRemove(srv);
+                continue;
+            };
+            // Keepalive/timeout tick, same as TCP/outbound QUIC.
+            conn.keepalive_active = true;
+            conn.keepalive_timer.run(self.loop, &conn.keepalive_completion, KEEPALIVE_TICK_MS, PeerConn, conn, onKeepaliveTick);
+            // Fill in the remote URI from the QUIC peer address.
+            if (quicSrvPeerRemoteString(self.gpa, qconn.peer)) |ra| {
+                conn.uri = std.fmt.allocPrint(self.gpa, "quic://{s}", .{ra}) catch "";
+                self.gpa.free(ra);
+            }
+            logInfo("quic listener: accepted conn from {s}", .{if (conn.uri.len > 0) conn.uri else "?"});
+        }
+    }
+
+    /// Pump one accepted conn: ensure it's still alive, locate (and answer) the
+    /// client's bidirectional stream, and forward STREAM bytes into the
+    /// ironwood handshake/frame parser.
+    fn quicSrvPump(self: *NetworkManager, listener: *QuicServerListener, srv: *QuicSrvConn) void {
+        _ = listener;
+        if (srv.closed) return;
+
+        // zquic may have reaped the ConnState (idle timeout); its slot goes
+        // null and the memory is freed, so never dereference past this check.
+        if (!quic_mod.serverConnAlive(srv.server, srv.quic_conn)) {
+            self.closeConn(srv.conn);
+            return;
+        }
+        const qconn = srv.quic_conn;
+        if (qconn.phase != .connected) {
+            self.closeConn(srv.conn);
+            return;
+        }
+
+        if (!srv.stream_found) {
+            const sid = self.quicSrvFindStream(srv) orelse return; // client hasn't opened yet
+            srv.stream_id = sid;
+            srv.stream_found = true;
+            // Both sides send their ironwood metadata once the transport is
+            // ready; the client opens the stream, so we answer on it.
+            const meta = Metadata.init(self.our_id.public_key, srv.conn.pending_options.priority);
+            const msg = meta.encode(&self.our_id, srv.conn.pending_options.password, self.gpa) catch {
+                self.closeConn(srv.conn);
+                return;
+            };
+            queueWrite(srv.conn, msg);
+            return;
+        }
+
+        if (quic_mod.io.rawAppStreamResetReceived(qconn, srv.stream_id)) |code| {
+            logInfo("quic listener: stream {d} reset (code {d})", .{ srv.stream_id, code });
+            self.closeConn(srv.conn);
+            return;
+        }
+
+        if (quic_mod.io.rawAppRecvBuffer(qconn, srv.stream_id)) |got| {
+            if (got.len > srv.recv_off) {
+                const fresh = got[srv.recv_off..];
+                srv.conn.read_buf.appendSlice(self.gpa, fresh) catch {
+                    self.closeConn(srv.conn);
+                    return;
+                };
+                srv.recv_off = got.len;
+                self.processBuffered(srv.conn) catch |err| {
+                    logInfo("quic listener: frame error: {}", .{err});
+                    self.closeConn(srv.conn);
+                    return;
+                };
+            }
+        }
+    }
+
+    /// Return the first active client-initiated bidirectional raw-app stream
+    /// (stream_id % 4 == 0) on `srv.quic_conn`, or null if none yet.
+    fn quicSrvFindStream(self: *NetworkManager, srv: *QuicSrvConn) ?u64 {
+        _ = self;
+        for (&srv.quic_conn.raw_app_streams) |*slot| {
+            if (slot.active and slot.stream_id % 4 == 0) return slot.stream_id;
+        }
+        return null;
+    }
+
+    /// Release the raw-app stream, unlink and free `srv`, and clear the
+    /// back-pointer on its `PeerConn` (which is still alive at this point --
+    /// `maybeDestroy` defers actual free until the keepalive timer fires).
+    fn quicSrvRemove(self: *NetworkManager, srv: *QuicSrvConn) void {
+        if (srv.stream_found) {
+            _ = quic_mod.io.releaseRawAppStream(srv.quic_conn, srv.stream_id, self.gpa);
+        }
+        if (srv.conn.quic_srv == srv) srv.conn.quic_srv = null;
+        const listener = srv.listener;
+        for (listener.conns.items, 0..) |item, i| {
+            if (item == srv) {
+                _ = listener.conns.swapRemove(i);
+                break;
+            }
+        }
+        self.gpa.destroy(srv);
+    }
+
     fn unwrapWs(self: *NetworkManager, conn: *PeerConn) !void {
         if (!conn.use_ws) return;
         if (!conn.ws_handshake_done) {
-            const parsed = ws.parseServerUpgrade(conn.ws_raw.items, &conn.ws_accept_b64) orelse return;
-            if (!parsed.ok) return error.BadWsUpgrade;
-            const remaining = conn.ws_raw.items[parsed.consumed..];
-            std.mem.copyForwards(u8, conn.ws_raw.items[0..remaining.len], remaining);
-            conn.ws_raw.shrinkRetainingCapacity(remaining.len);
-            conn.ws_handshake_done = true;
-            logInfo("websocket upgrade complete", .{});
+            if (conn.inbound) {
+                // Server side: parse the client's upgrade request and answer 101.
+                const req = ws.parseClientUpgrade(conn.ws_raw.items) orelse return;
+                if (!req.ok) return error.BadWsUpgrade;
+                const resp = try ws.buildServerUpgrade(self.gpa, req.key);
+                const prev = conn.use_ws;
+                conn.use_ws = false; // queue the 101 response raw (unframed)
+                queueWrite(conn, resp);
+                conn.use_ws = prev;
+                const remaining = conn.ws_raw.items[req.consumed..];
+                std.mem.copyForwards(u8, conn.ws_raw.items[0..remaining.len], remaining);
+                conn.ws_raw.shrinkRetainingCapacity(remaining.len);
+                conn.ws_handshake_done = true;
+                logInfo("websocket upgrade complete (server)", .{});
+            } else {
+                // Client side: parse the server's 101 response.
+                const parsed = ws.parseServerUpgrade(conn.ws_raw.items, &conn.ws_accept_b64) orelse return;
+                if (!parsed.ok) return error.BadWsUpgrade;
+                const remaining = conn.ws_raw.items[parsed.consumed..];
+                std.mem.copyForwards(u8, conn.ws_raw.items[0..remaining.len], remaining);
+                conn.ws_raw.shrinkRetainingCapacity(remaining.len);
+                conn.ws_handshake_done = true;
+                logInfo("websocket upgrade complete", .{});
+            }
             const meta = Metadata.init(self.our_id.public_key, conn.pending_options.priority);
             const msg = try meta.encode(&self.our_id, conn.pending_options.password, self.gpa);
             queueWrite(conn, msg);
@@ -1333,7 +1717,10 @@ pub const NetworkManager = struct {
                     try conn.read_buf.appendSlice(self.gpa, decoded.frame.payload);
                 },
                 .ping => {
-                    const pong = ws.encodeFrame(self.gpa, .pong, decoded.frame.payload) catch break;
+                    const pong = (if (conn.inbound)
+                        ws.encodeServerFrame(self.gpa, .pong, decoded.frame.payload)
+                    else
+                        ws.encodeFrame(self.gpa, .pong, decoded.frame.payload)) catch break;
                     const prev = conn.use_ws;
                     conn.use_ws = false;
                     queueWrite(conn, pong);
@@ -1469,7 +1856,10 @@ pub const NetworkManager = struct {
         var payload = data;
         const packet_type: ?wire.PacketType = if (wire.decodeFrame(payload)) |decoded| decoded.packet_type else |_| null;
         if (conn.use_ws and conn.ws_handshake_done) {
-            const framed = ws.encodeFrame(conn.manager.gpa, .binary, payload) catch {
+            const framed = (if (conn.inbound)
+                ws.encodeServerFrame(conn.manager.gpa, .binary, payload)
+            else
+                ws.encodeFrame(conn.manager.gpa, .binary, payload)) catch {
                 conn.manager.gpa.free(payload);
                 return;
             };
@@ -1484,6 +1874,17 @@ pub const NetworkManager = struct {
             }
             const n = link.client.sendRawStreamData(link.stream_id, link.send_off, payload, false);
             if (n > 0) link.send_off += n;
+            conn.manager.gpa.free(payload);
+            return;
+        }
+
+        if (conn.quic_srv) |srv| {
+            if (!srv.stream_found or srv.closed) {
+                conn.manager.gpa.free(payload);
+                return;
+            }
+            const n = srv.server.sendRawStreamData(srv.quic_conn, srv.stream_id, srv.send_off, payload, false);
+            if (n > 0) srv.send_off += n;
             conn.manager.gpa.free(payload);
             return;
         }
@@ -1748,6 +2149,32 @@ fn tcpFd(tcp: xev.TCP) switch (builtin.os.tag) {
     };
 }
 
+/// The port a listener's socket is actually bound to (resolving `:0` /
+/// ephemeral binds via `getsockname`). 0 if it can't be determined.
+fn listenerBoundPort(tcp: xev.TCP) u16 {
+    var storage: std.posix.sockaddr.storage = std.mem.zeroes(std.posix.sockaddr.storage);
+    var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+    switch (builtin.os.tag) {
+        .windows => {
+            if (std.os.windows.ws2_32.getsockname(tcpFd(tcp), @ptrCast(&storage), &len) != 0) return 0;
+        },
+        else => {
+            if (std.c.getsockname(tcpFd(tcp), @ptrCast(&storage), &len) != 0) return 0;
+        },
+    }
+    return switch (storage.family) {
+        std.posix.AF.INET => blk: {
+            const sa: *align(1) const std.posix.sockaddr.in = @ptrCast(&storage);
+            break :blk std.mem.bigToNative(u16, sa.port);
+        },
+        std.posix.AF.INET6 => blk: {
+            const sa: *align(1) const std.posix.sockaddr.in6 = @ptrCast(&storage);
+            break :blk std.mem.bigToNative(u16, sa.port);
+        },
+        else => 0,
+    };
+}
+
 /// `addr:port` text for the remote end of `tcp`, formatted like Go's
 /// `net.TCPAddr.String()` (IPv6 bracketed). Null if the platform can't say.
 fn remoteAddrString(gpa: std.mem.Allocator, tcp: xev.TCP) ?[]u8 {
@@ -1774,6 +2201,28 @@ fn remoteAddrString(gpa: std.mem.Allocator, tcp: xev.TCP) ?[]u8 {
             var iw = std.Io.Writer.fixed(&ip);
             node.address.formatIpv6(&sa.addr, &iw) catch return null;
             break :blk std.fmt.bufPrint(&buf, "[{s}]:{d}", .{ ip[0..iw.end], std.mem.bigToNative(u16, sa.port) }) catch return null;
+        },
+        else => return null,
+    };
+    return gpa.dupe(u8, txt) catch null;
+}
+
+/// Format a zquic peer `compat.Address` as `host:port` (IPv4) or
+/// `[host]:port` (IPv6), for the accepted conn's `remote` URI.
+fn quicSrvPeerRemoteString(gpa: std.mem.Allocator, addr: quic_mod.compat.Address) ?[]u8 {
+    var buf: [128]u8 = undefined;
+    const txt = switch (addr.any.family) {
+        std.posix.AF.INET => blk: {
+            const bytes: [4]u8 = @bitCast(addr.in.addr);
+            break :blk std.fmt.bufPrint(&buf, "{d}.{d}.{d}.{d}:{d}", .{
+                bytes[0], bytes[1], bytes[2], bytes[3], std.mem.bigToNative(u16, addr.in.port),
+            }) catch return null;
+        },
+        std.posix.AF.INET6 => blk: {
+            var ip: [45]u8 = undefined;
+            var iw = std.Io.Writer.fixed(&ip);
+            node.address.formatIpv6(&addr.in6.addr, &iw) catch return null;
+            break :blk std.fmt.bufPrint(&buf, "[{s}]:{d}", .{ ip[0..iw.end], std.mem.bigToNative(u16, addr.in6.port) }) catch return null;
         },
         else => return null,
     };
@@ -1811,10 +2260,20 @@ const ListenerState = struct {
     use_ws: bool = false,
     scheme: []const u8 = "tcp",
     options: LinkOptions = .{},
+    /// Set for a `unix://` listener so the socket file can be unlinked on
+    /// shutdown. Null for `tcp://` (and for abstract unix sockets).
+    unix_path: ?[]const u8 = null,
 
     fn deinit(self: *ListenerState, gpa: std.mem.Allocator) void {
         if (self.scheme.len > 0) gpa.free(self.scheme);
         if (self.options.uri.len > 0) gpa.free(self.options.uri);
+        if (self.unix_path) |p| {
+            var buf: [108]u8 = undefined;
+            if (std.fmt.bufPrintZ(&buf, "{s}", .{p})) |z| {
+                _ = std.posix.system.unlink(z.ptr);
+            } else |_| {}
+            gpa.free(p);
+        }
         gpa.destroy(self);
     }
 };

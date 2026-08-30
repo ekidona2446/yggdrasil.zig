@@ -98,31 +98,95 @@ pub fn parseServerUpgrade(buf: []const u8, expected_accept_b64: []const u8) ?Upg
 
 /// Encode a masked client binary (or control) frame. Caller owns the result.
 pub fn encodeFrame(gpa: std.mem.Allocator, opcode: Opcode, payload: []const u8) ![]u8 {
+    return encodeFrameImpl(gpa, opcode, payload, true);
+}
+
+/// Encode an *unmasked* server frame (RFC 6455 §5.1: servers MUST NOT mask).
+pub fn encodeServerFrame(gpa: std.mem.Allocator, opcode: Opcode, payload: []const u8) ![]u8 {
+    return encodeFrameImpl(gpa, opcode, payload, false);
+}
+
+fn encodeFrameImpl(gpa: std.mem.Allocator, opcode: Opcode, payload: []const u8, masked: bool) ![]u8 {
     const len = payload.len;
     const ext: usize = if (len < 126) 0 else if (len <= 0xffff) 2 else 8;
-    const total = 2 + ext + 4 + len;
+    const mask_len: usize = if (masked) 4 else 0;
+    const total = 2 + ext + mask_len + len;
     const out = try gpa.alloc(u8, total);
     out[0] = 0x80 | @intFromEnum(opcode);
     var pos: usize = 2;
     if (len < 126) {
-        out[1] = 0x80 | @as(u8, @intCast(len));
+        out[1] = (if (masked) @as(u8, 0x80) else 0) | @as(u8, @intCast(len));
     } else if (len <= 0xffff) {
-        out[1] = 0x80 | 126;
+        out[1] = (if (masked) @as(u8, 0x80) else 0) | 126;
         std.mem.writeInt(u16, out[2..4], @intCast(len), .big);
         pos = 4;
     } else {
-        out[1] = 0x80 | 127;
+        out[1] = (if (masked) @as(u8, 0x80) else 0) | 127;
         std.mem.writeInt(u64, out[2..10], len, .big);
         pos = 10;
     }
-    var mask: [4]u8 = undefined;
-    ironwood.crypto.secureRandomBytes(&mask);
-    @memcpy(out[pos .. pos + 4], &mask);
-    pos += 4;
-    for (payload, 0..) |b, i| {
-        out[pos + i] = b ^ mask[i % 4];
+    if (masked) {
+        var mask: [4]u8 = undefined;
+        ironwood.crypto.secureRandomBytes(&mask);
+        @memcpy(out[pos .. pos + 4], &mask);
+        pos += 4;
+        for (payload, 0..) |b, i| {
+            out[pos + i] = b ^ mask[i % 4];
+        }
+    } else {
+        @memcpy(out[pos..], payload);
     }
     return out;
+}
+
+pub const ClientUpgradeResult = struct {
+    consumed: usize,
+    key: []const u8, // Sec-WebSocket-Key value (slice into `buf`)
+    ok: bool,
+};
+
+/// Parse a *client's* HTTP upgrade request (server side). Returns null if the
+/// request is still incomplete (no terminating `\r\n\r\n` yet).
+pub fn parseClientUpgrade(buf: []const u8) ?ClientUpgradeResult {
+    const end = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return null;
+    const headers = buf[0..end];
+    const consumed = end + 4;
+    if (!std.mem.startsWith(u8, headers, "GET ")) {
+        return .{ .consumed = consumed, .key = &.{}, .ok = false };
+    }
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    _ = lines.next(); // request line
+    var key: []const u8 = &.{};
+    var saw_upgrade = false;
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (std.ascii.eqlIgnoreCase(name, "Sec-WebSocket-Key")) {
+            key = value;
+        } else if (std.ascii.eqlIgnoreCase(name, "Upgrade") and std.ascii.eqlIgnoreCase(value, "websocket")) {
+            saw_upgrade = true;
+        }
+    }
+    if (key.len == 0 or !saw_upgrade) {
+        return .{ .consumed = consumed, .key = key, .ok = false };
+    }
+    return .{ .consumed = consumed, .key = key, .ok = true };
+}
+
+/// Build the `101 Switching Protocols` response to a client's upgrade request.
+pub fn buildServerUpgrade(gpa: std.mem.Allocator, key_b64: []const u8) ![]u8 {
+    var accept: [28]u8 = undefined;
+    acceptKey(key_b64, &accept);
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    errdefer w.deinit();
+    try w.writer.writeAll("HTTP/1.1 101 Switching Protocols\r\n");
+    try w.writer.writeAll("Upgrade: websocket\r\n");
+    try w.writer.writeAll("Connection: Upgrade\r\n");
+    try w.writer.print("Sec-WebSocket-Accept: {s}\r\n", .{accept});
+    try w.writer.print("Sec-WebSocket-Protocol: {s}\r\n", .{SUBPROTOCOL});
+    try w.writer.writeAll("\r\n");
+    return w.toOwnedSlice();
 }
 
 pub const DecodeError = error{ Incomplete, InvalidFrame, Close };

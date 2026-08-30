@@ -37,6 +37,28 @@ pub const FirewallConfig = struct {
     allow_icmp_echo: bool = true,
 };
 
+/// One entry of `tunnel_routing.remote_subnets`: a hex public key mapped to a
+/// list of CIDR prefixes (with the reference's `~`/`!`/`inetv4`/`inetv6`
+/// syntax preserved verbatim; the CKR module expands them).
+pub const RemoteSubnetConfig = struct {
+    key_hex: []const u8,
+    cidrs: []const []const u8,
+};
+
+/// Crypto-Key Routing (CKR) configuration, mirroring the Rust reference's
+/// `[tunnel_routing]` section.
+pub const TunnelRoutingConfig = struct {
+    enable: bool = false,
+    yggdrasil_routing: bool = true,
+    /// Deprecated single IPv4 CIDR (kept for config compatibility).
+    ipv4_address: []const u8 = &.{},
+    /// IP addresses/CIDRs to assign to the TUN (IPv4 or IPv6).
+    ip_addresses: []const []const u8 = &.{},
+    /// Hex public key -> CIDR list.
+    remote_subnets: []const RemoteSubnetConfig = &.{},
+    install_system_routes: bool = true,
+};
+
 /// Yggdrasil node configuration.
 pub const Config = struct {
     /// Ed25519 private key as 128-char hex string (64 bytes).
@@ -61,6 +83,8 @@ pub const Config = struct {
     multicast_interfaces: []const MulticastInterfaceConfig = &.{},
     /// Firewall.
     firewall: FirewallConfig = .{},
+    /// Crypto-Key Routing tunnel configuration.
+    tunnel_routing: TunnelRoutingConfig = .{},
     /// Closed-network group password.
     group_password: []const u8 = &.{},
     /// Ironwood config (delegated).
@@ -154,6 +178,15 @@ pub const Config = struct {
         for (self.firewall.open_all_for) |s| gpa.free(s);
         gpa.free(self.firewall.open_all_for);
         gpa.free(self.group_password);
+        gpa.free(self.tunnel_routing.ipv4_address);
+        for (self.tunnel_routing.ip_addresses) |a| gpa.free(a);
+        gpa.free(self.tunnel_routing.ip_addresses);
+        for (self.tunnel_routing.remote_subnets) |r| {
+            gpa.free(r.key_hex);
+            for (r.cidrs) |c| gpa.free(c);
+            gpa.free(r.cidrs);
+        }
+        gpa.free(self.tunnel_routing.remote_subnets);
     }
 
     /// Serialize to our TOML subset (matches the reference config's shape
@@ -198,6 +231,29 @@ pub const Config = struct {
         try writeIntArray(writer, "open_udp", self.firewall.open_udp);
         try writeStringArray(writer, "open_all_for", self.firewall.open_all_for);
         try writer.print("allow_icmp_echo = {}\n", .{self.firewall.allow_icmp_echo});
+
+        if (self.tunnel_routing.enable or self.tunnel_routing.remote_subnets.len > 0 or
+            self.tunnel_routing.ip_addresses.len > 0 or self.tunnel_routing.ipv4_address.len > 0)
+        {
+            try writer.writeAll("\n[tunnel_routing]\n");
+            try writer.print("enable = {}\n", .{self.tunnel_routing.enable});
+            try writer.print("yggdrasil_routing = {}\n", .{self.tunnel_routing.yggdrasil_routing});
+            if (self.tunnel_routing.ipv4_address.len > 0)
+                try writer.print("ipv4_address = \"{s}\"\n", .{self.tunnel_routing.ipv4_address});
+            try writeStringArray(writer, "ip_addresses", self.tunnel_routing.ip_addresses);
+            try writer.print("install_system_routes = {}\n", .{self.tunnel_routing.install_system_routes});
+            if (self.tunnel_routing.remote_subnets.len > 0) {
+                try writer.writeAll("\n[tunnel_routing.remote_subnets]\n");
+                for (self.tunnel_routing.remote_subnets) |r| {
+                    try writer.print("\"{s}\" = [", .{r.key_hex});
+                    for (r.cidrs, 0..) |c, i| {
+                        if (i > 0) try writer.writeAll(", ");
+                        try writer.print("\"{s}\"", .{c});
+                    }
+                    try writer.writeAll("]\n");
+                }
+            }
+        }
     }
 
     fn writeStringArray(writer: *std.Io.Writer, name: []const u8, items: []const []const u8) !void {
@@ -250,6 +306,10 @@ pub const Config = struct {
         defer open_udp.deinit(gpa);
         var open_all_for = std.ArrayListUnmanaged([]const u8).empty;
         defer open_all_for.deinit(gpa);
+        var ip_addresses = std.ArrayListUnmanaged([]const u8).empty;
+        defer ip_addresses.deinit(gpa);
+        var remote_subnets = std.ArrayListUnmanaged(RemoteSubnetConfig).empty;
+        defer remote_subnets.deinit(gpa);
 
         var section: Section = .root;
         var cur_mc: MulticastInterfaceConfig = .{};
@@ -270,7 +330,7 @@ pub const Config = struct {
                 try pending_array_items.append(gpa, ' ');
                 if (std.mem.indexOfScalar(u8, line, ']') != null) {
                     in_multiline_array = false;
-                    try applyArrayValue(gpa, pending_key.?, pending_array_items.items, section, &cfg, &peers, &listen, &allowed_keys, &open_tcp, &open_udp, &open_all_for, &cur_mc);
+                    try applyArrayValue(gpa, pending_key.?, pending_array_items.items, section, &cfg, &peers, &listen, &allowed_keys, &open_tcp, &open_udp, &open_all_for, &ip_addresses, &remote_subnets, &cur_mc);
                     pending_array_items.clearRetainingCapacity();
                     pending_key = null;
                 }
@@ -301,6 +361,10 @@ pub const Config = struct {
                     section = .firewall;
                 } else if (std.mem.eql(u8, name, "node_info")) {
                     section = .node_info;
+                } else if (std.mem.eql(u8, name, "tunnel_routing")) {
+                    section = .tunnel_routing;
+                } else if (std.mem.eql(u8, name, "tunnel_routing.remote_subnets")) {
+                    section = .tunnel_routing_remote_subnets;
                 } else {
                     section = .unknown;
                 }
@@ -322,7 +386,7 @@ pub const Config = struct {
             }
 
             if (value.len > 0 and value[0] == '[') {
-                try applyArrayValue(gpa, key, value, section, &cfg, &peers, &listen, &allowed_keys, &open_tcp, &open_udp, &open_all_for, &cur_mc);
+                try applyArrayValue(gpa, key, value, section, &cfg, &peers, &listen, &allowed_keys, &open_tcp, &open_udp, &open_all_for, &ip_addresses, &remote_subnets, &cur_mc);
                 continue;
             }
 
@@ -339,6 +403,8 @@ pub const Config = struct {
         cfg.firewall.open_tcp = try open_tcp.toOwnedSlice(gpa);
         cfg.firewall.open_udp = try open_udp.toOwnedSlice(gpa);
         cfg.firewall.open_all_for = try open_all_for.toOwnedSlice(gpa);
+        cfg.tunnel_routing.ip_addresses = try ip_addresses.toOwnedSlice(gpa);
+        cfg.tunnel_routing.remote_subnets = try remote_subnets.toOwnedSlice(gpa);
         if (cfg.admin_listen.len == 0) cfg.admin_listen = try gpa.dupe(u8, "tcp://localhost:9001");
         if (cfg.if_name.len == 0) cfg.if_name = try gpa.dupe(u8, "auto");
         if (cfg.node_info.len == 0) cfg.node_info = try gpa.dupe(u8, "{}");
@@ -346,7 +412,7 @@ pub const Config = struct {
         return cfg;
     }
 
-    const Section = enum { root, firewall, node_info, multicast_interfaces, unknown };
+    const Section = enum { root, firewall, node_info, multicast_interfaces, tunnel_routing, tunnel_routing_remote_subnets, unknown };
 
     fn cloneMulticast(gpa: std.mem.Allocator, m: MulticastInterfaceConfig) !MulticastInterfaceConfig {
         return .{
@@ -404,6 +470,17 @@ pub const Config = struct {
                     cfg.firewall.allow_icmp_echo = std.mem.eql(u8, value, "true");
                 }
             },
+            .tunnel_routing => {
+                if (std.mem.eql(u8, key, "enable")) {
+                    cfg.tunnel_routing.enable = std.mem.eql(u8, value, "true");
+                } else if (std.mem.eql(u8, key, "yggdrasil_routing")) {
+                    cfg.tunnel_routing.yggdrasil_routing = std.mem.eql(u8, value, "true");
+                } else if (std.mem.eql(u8, key, "install_system_routes")) {
+                    cfg.tunnel_routing.install_system_routes = std.mem.eql(u8, value, "true");
+                } else if (std.mem.eql(u8, key, "ipv4_address")) {
+                    cfg.tunnel_routing.ipv4_address = try gpa.dupe(u8, value);
+                }
+            },
             .multicast_interfaces => {
                 // NOTE: stores raw slices into the (caller-owned, longer-
                 // lived-than-this-function) `text` buffer, not heap dupes --
@@ -426,7 +503,7 @@ pub const Config = struct {
                     cur_mc.password = value;
                 }
             },
-            .node_info, .unknown => {},
+            .node_info, .tunnel_routing_remote_subnets, .unknown => {},
         }
     }
 
@@ -442,6 +519,8 @@ pub const Config = struct {
         open_tcp: *std.ArrayListUnmanaged(u16),
         open_udp: *std.ArrayListUnmanaged(u16),
         open_all_for: *std.ArrayListUnmanaged([]const u8),
+        ip_addresses: *std.ArrayListUnmanaged([]const u8),
+        remote_subnets: *std.ArrayListUnmanaged(RemoteSubnetConfig),
         cur_mc: *MulticastInterfaceConfig,
     ) !void {
         _ = cur_mc;
@@ -462,6 +541,18 @@ pub const Config = struct {
             try appendIntItems(gpa, inner, open_udp);
         } else if (section == .firewall and std.mem.eql(u8, key, "open_all_for")) {
             try appendStringItems(gpa, inner, open_all_for);
+        } else if (section == .tunnel_routing and std.mem.eql(u8, key, "ip_addresses")) {
+            try appendStringItems(gpa, inner, ip_addresses);
+        } else if (section == .tunnel_routing_remote_subnets) {
+            // `"pubkey_hex" = ["cidr", ...]` — the key is a quoted string.
+            const key_hex = unquote(std.mem.trim(u8, key, " \t"));
+            var cidrs = std.ArrayListUnmanaged([]const u8).empty;
+            errdefer cidrs.deinit(gpa);
+            try appendStringItems(gpa, inner, &cidrs);
+            try remote_subnets.append(gpa, .{
+                .key_hex = try gpa.dupe(u8, key_hex),
+                .cidrs = try cidrs.toOwnedSlice(gpa),
+            });
         } else {
             _ = cfg;
         }

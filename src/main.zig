@@ -183,6 +183,26 @@ pub fn main(init: std.process.Init) !void {
     var rwc = try ReadWriteCloser.init(gpa, &core, mtu);
     defer rwc.deinit();
 
+    // -- Stateful firewall -------------------------------------------------
+    var fw: node.firewall.Firewall = undefined;
+    fw = node.firewall.Firewall.init(gpa, cfg.firewall) catch |err| blk: {
+        std.debug.print("[ygg] firewall: failed to initialise ({}); continuing with firewall disabled\n", .{err});
+        break :blk node.firewall.Firewall.init(gpa, .{ .enable = false, .open_tcp = &.{}, .open_udp = &.{}, .open_all_for = &.{}, .allow_icmp_echo = true }) catch unreachable;
+    };
+    defer fw.deinit();
+    rwc.setFirewall(&fw);
+    if (fw.enabled())
+        std.debug.print("status: stateful firewall enabled (open_tcp={d}, open_udp={d}, open_all_for={d})\n", .{ fw.open_tcp.count(), fw.open_udp.count(), fw.open_all_for.items.len });
+
+    // -- Crypto-Key Routing (CKR) ----------------------------------------
+    var ckr_table: ?node.ckr.CkrTable = null;
+    if (cfg.tunnel_routing.enable) {
+        ckr_table = try node.ckr.CkrTable.init(gpa, &cfg.tunnel_routing, id.public_key);
+        rwc.setCkr(&ckr_table.?);
+        std.debug.print("status: CKR tunnel routing enabled ({d} route(s))\n", .{ckr_table.?.routes.len});
+    }
+    defer if (ckr_table) |*c| c.deinit();
+
     var app = App{ .gpa = gpa, .net = &net, .rwc = &rwc, .tun = null, .tun_adapter = null };
     net.on_deliver = App.onDeliverTrampoline;
     net.on_deliver_ud = &app;
@@ -200,6 +220,27 @@ pub fn main(init: std.process.Init) !void {
             node.tun.assignAddressForAdapter(t, addr, @intCast(mtu)) catch |err| {
                 std.debug.print("[ygg] warning: failed to assign TUN address ({}); configure manually\n", .{err});
             };
+            // CKR: assign any configured tunnel addresses (ip_addresses, with
+            // the deprecated ipv4_address as a fallback) to the TUN device.
+            if (cfg.tunnel_routing.enable) {
+                // Match the reference's precedence rule: the deprecated
+                // `ipv4_address` is used only when *every* `ip_addresses`
+                // entry is empty (see Yggdrasil-ng `tun.rs`:
+                // `ip_addresses.iter().all(|s| s.is_empty())`).
+                var all_empty: bool = true;
+                for (cfg.tunnel_routing.ip_addresses) |cidr| {
+                    if (cidr.len == 0) continue;
+                    all_empty = false;
+                    node.tun.assignCidrAddressForAdapter(t, cidr) catch |err| {
+                        std.debug.print("[ygg] warning: failed to assign CKR address {s} ({}); configure manually\n", .{ cidr, err });
+                    };
+                }
+                if (all_empty and cfg.tunnel_routing.ipv4_address.len > 0) {
+                    node.tun.assignCidrAddressForAdapter(t, cfg.tunnel_routing.ipv4_address) catch |err| {
+                        std.debug.print("[ygg] warning: failed to assign CKR address {s} ({}); configure manually\n", .{ cfg.tunnel_routing.ipv4_address, err });
+                    };
+                }
+            }
             var name_buf = t.interfaceName();
             std.debug.print("status: tun device '{s}' up\n", .{std.mem.sliceTo(&name_buf, 0)});
         }
@@ -216,6 +257,22 @@ pub fn main(init: std.process.Init) !void {
     }
     defer if (tun_io) |*t| t.deinit();
 
+    // -- CKR system routes (best-effort) ----------------------------------
+    if (ckr_table != null) {
+        if (tun_adapter) |*t| {
+            const tun_name_z = std.mem.sliceTo(&t.interfaceName(), 0);
+            node.ckr_routes.installSystemRoutes(gpa, &cfg.tunnel_routing, tun_name_z, id.public_key) catch |err| {
+                std.debug.print("[ygg] warning: failed to install CKR system routes ({})\n", .{err});
+            };
+        }
+    }
+    defer if (ckr_table != null) {
+        if (tun_adapter) |*t| {
+            const tun_name_z = std.mem.sliceTo(&t.interfaceName(), 0);
+            node.ckr_routes.removeSystemRoutes(gpa, &cfg.tunnel_routing, tun_name_z, id.public_key);
+        }
+    };
+
     // -- Peers / listeners ------------------------------------------------
     for (effective_peers.items) |peer_uri| {
         net.addOutboundPeer(peer_uri, .{ .password = password }) catch |err| {
@@ -223,10 +280,21 @@ pub fn main(init: std.process.Init) !void {
         };
     }
     for (effective_listen.items) |listen_uri| {
-        net.addListener(listen_uri) catch |err| {
+        _ = net.addListener(listen_uri) catch |err| {
             std.debug.print("[ygg] failed to listen on {s}: {}\n", .{ listen_uri, err });
         };
     }
+
+    // -- LAN multicast discovery ------------------------------------------
+    var multicast: ?node.multicast.Multicast = null;
+    if (cfg.multicast_interfaces.len > 0) {
+        multicast = try node.multicast.Multicast.init(gpa, &loop, &net, id.public_key, cfg.multicast_interfaces);
+        app.multicast = &multicast.?;
+        multicast.?.start() catch |err| {
+            std.debug.print("[ygg] multicast discovery failed to start: {}\n", .{err});
+        };
+    }
+    defer if (multicast) |*m| m.deinit();
 
     // -- Admin socket ---------------------------------------------------
     // The handler runs on the loop thread (see admin_server.zig), which is what
@@ -234,7 +302,7 @@ pub fn main(init: std.process.Init) !void {
     // libxev timers, neither of which may happen on another thread.
     var admin_socket = node.admin.AdminSocket.init(gpa, &core);
     admin_socket.net = &net;
-    admin_socket.hooks = .{ .ctx = &app, .tun = App.adminTunInfo };
+    admin_socket.hooks = .{ .ctx = &app, .tun = App.adminTunInfo, .multicast_interfaces = App.adminMulticastInterfaces };
     var admin_server = node.admin_server.Server.init(gpa, &loop, &admin_socket);
     defer admin_server.deinit();
     if (admin_listen.len == 0 or std.mem.eql(u8, admin_listen, "none")) {
@@ -374,6 +442,8 @@ const App = struct {
     /// Kept separately from `tun` because `getTun`'s reply needs the adapter's
     /// name and MTU, which are the same on every platform while `TunIo` is not.
     tun_adapter: ?*TunAdapter = null,
+    /// LAN multicast peer discovery, when enabled via config.
+    multicast: ?*node.multicast.Multicast = null,
 
     /// `admin.getTun`: the reference reports `enabled` always and `name`/`mtu`
     /// only while the device exists (`GetTUNResponse`'s `omitempty` tags).
@@ -386,6 +456,17 @@ const App = struct {
         var name_buf = t.interfaceName();
         const name = std.mem.sliceTo(&name_buf, 0);
         out.print("{{\"enabled\":true,\"name\":\"{s}\",\"mtu\":{d}}}", .{ name, t.mtu }) catch return error.WriteFailed;
+    }
+
+    /// `admin.getMulticastInterfaces`: report which interfaces multicast is
+    /// enabled on, mirroring Go's `GetMulticastInterfacesResponse`.
+    fn adminMulticastInterfaces(ctx: *anyopaque, out: *std.Io.Writer) node.admin.AdminError!void {
+        const app: *App = @ptrCast(@alignCast(ctx));
+        if (app.multicast) |mc| {
+            mc.writeAdminJson(out) catch return error.WriteFailed;
+        } else {
+            out.writeAll("{\"multicast_interfaces\":[]}") catch return error.WriteFailed;
+        }
     }
 
     fn onDeliverTrampoline(ud: ?*anyopaque, source: *const ironwood.PublicKey, data: []const u8) void {

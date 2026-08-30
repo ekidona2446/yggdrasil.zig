@@ -114,6 +114,73 @@ const in6_ifreq = extern struct {
     ifindex: i32,
 };
 
+/// Assign an arbitrary IPv4/IPv6 address in CIDR notation (e.g. "10.99.0.1/24"
+/// or "2005:8a:9:11::3/64") to the interface, via raw ioctls. Used for CKR
+/// tunnel addresses. Requires CAP_NET_ADMIN / root.
+pub fn assignCidrAddress(ifname: []const u8, cidr: []const u8) !void {
+    const trunc_len = @min(ifname.len, 15);
+
+    // Parse "addr/prefix" (prefix optional; /32 and /128 defaults).
+    var addr_text = cidr;
+    var prefix: u32 = 0;
+    var has_prefix = false;
+    if (std.mem.indexOfScalar(u8, cidr, '/')) |slash| {
+        addr_text = cidr[0..slash];
+        prefix = std.fmt.parseInt(u32, cidr[slash + 1 ..], 10) catch return error.BadCidr;
+        has_prefix = true;
+    }
+
+    if (std.mem.indexOfScalar(u8, addr_text, ':') != null) {
+        const ip6 = std.Io.net.Ip6Address.parse(addr_text, 0) catch return error.BadCidr;
+        if (!has_prefix) prefix = 128;
+        if (prefix > 128) return error.BadCidr;
+
+        const sock6: usize = std.os.linux.socket(std.os.linux.AF.INET6, std.os.linux.SOCK.DGRAM, 0);
+        if (@as(isize, @bitCast(sock6)) < 0) return error.SocketFailed;
+        const fd6: i32 = @intCast(sock6);
+        defer _ = std.os.linux.close(fd6);
+
+        var ifr: [40]u8 = [_]u8{0} ** 40;
+        @memcpy(ifr[0..trunc_len], ifname[0..trunc_len]);
+        const SIOCGIFINDEX: u64 = 0x8933;
+        if (std.os.linux.ioctl(fd6, SIOCGIFINDEX, @intFromPtr(&ifr)) != 0) return error.IfIndexFailed;
+        const ifindex = std.mem.readInt(i32, ifr[16..20], .native);
+
+        var ifr6 = in6_ifreq{ .addr = ip6.bytes, .prefixlen = prefix, .ifindex = ifindex };
+        const SIOCSIFADDR: u64 = 0x8916;
+        if (std.os.linux.ioctl(fd6, SIOCSIFADDR, @intFromPtr(&ifr6)) != 0) return error.SetAddrFailed;
+        return;
+    }
+
+    const ip4 = std.Io.net.Ip4Address.parse(addr_text, 0) catch return error.BadCidr;
+    if (!has_prefix) prefix = 32;
+    if (prefix > 32) return error.BadCidr;
+
+    const sock4: usize = std.os.linux.socket(std.os.linux.AF.INET, std.os.linux.SOCK.DGRAM, 0);
+    if (@as(isize, @bitCast(sock4)) < 0) return error.SocketFailed;
+    const fd4: i32 = @intCast(sock4);
+    defer _ = std.os.linux.close(fd4);
+
+    var ifr: [40]u8 = [_]u8{0} ** 40;
+    @memcpy(ifr[0..trunc_len], ifname[0..trunc_len]);
+    // `ifr_addr` is a `sockaddr_in`: family (u16), port (u16), addr (u32 BE).
+    std.mem.writeInt(u16, ifr[16..18], @intCast(std.os.linux.AF.INET), .native);
+    std.mem.writeInt(u16, ifr[18..20], 0, .native);
+    @memcpy(ifr[20..24], &ip4.bytes);
+    const SIOCSIFADDR: u64 = 0x8916;
+    if (std.os.linux.ioctl(fd4, SIOCSIFADDR, @intFromPtr(&ifr)) != 0) return error.SetAddrFailed;
+
+    // Set the netmask so the address carries the requested /prefix length.
+    const mask: u32 = if (prefix == 0) 0 else ~((@as(u32, 1) << @intCast(32 - prefix)) - 1);
+    var ifr_mask: [40]u8 = [_]u8{0} ** 40;
+    @memcpy(ifr_mask[0..trunc_len], ifname[0..trunc_len]);
+    std.mem.writeInt(u16, ifr_mask[16..18], @intCast(std.os.linux.AF.INET), .native);
+    std.mem.writeInt(u16, ifr_mask[18..20], 0, .native);
+    std.mem.writeInt(u32, ifr_mask[20..24], mask, .big);
+    const SIOCSIFNETMASK: u64 = 0x891c;
+    _ = std.os.linux.ioctl(fd4, SIOCSIFNETMASK, @intFromPtr(&ifr_mask));
+}
+
 /// Assign the Yggdrasil IPv6 address (with /7 "network" visibility, matching
 /// the reference implementation's use of a broad on-link prefix) to the given
 /// interface, and bring it up. Uses raw ioctls (SIOCGIFINDEX + SIOCSIFADDR on

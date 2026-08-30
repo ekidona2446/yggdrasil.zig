@@ -55,6 +55,36 @@ const win = struct {
 /// Resolve `host` to a list of IP addresses (caller owns the returned slice).
 /// Both A and AAAA records are returned, in the order the resolver gives them.
 pub fn resolve(gpa: std.mem.Allocator, host: []const u8, port: u16) ![]std.Io.net.IpAddress {
+    // Link-local IPv6 with an explicit scope, e.g. `fe80::1%2` or `fe80::1%eth0`
+    // (multicast peers dial these). `Ip6Address.parse` refuses scopes and
+    // `getaddrinfo` drops them, so resolve the zone to an interface index here.
+    if (std.mem.indexOfScalar(u8, host, '%')) |pct| {
+        const addr_text = host[0..pct];
+        const zone_text = host[pct + 1 ..];
+        if (std.Io.net.Ip6Address.parse(addr_text, port)) |ip6| {
+            const idx: u32 = if (std.fmt.parseInt(u32, zone_text, 10)) |n|
+                n
+            else |_| blk: {
+                // Named scope: `%eth0`. `if_nametoindex` is unavailable on
+                // Windows, so leave the index unresolved there.
+                if (is_windows) break :blk 0;
+                var zbuf: [64]u8 = undefined;
+                if (zone_text.len >= zbuf.len) break :blk 0;
+                @memcpy(zbuf[0..zone_text.len], zone_text);
+                zbuf[zone_text.len] = 0;
+                const n: c_uint = @intCast(c.if_nametoindex(zbuf[0..zone_text.len :0].ptr));
+                break :blk n;
+            };
+            if (idx != 0) {
+                var scoped = ip6;
+                scoped.interface = .{ .index = idx };
+                const out = try gpa.alloc(std.Io.net.IpAddress, 1);
+                out[0] = .{ .ip6 = scoped };
+                return out;
+            }
+        } else |_| {}
+    }
+
     // Fast path: literal IP addresses don't need a resolver round-trip.
     if (std.Io.net.IpAddress.parseLiteral(host)) |lit| {
         var addr = lit;

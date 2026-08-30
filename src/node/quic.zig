@@ -61,6 +61,106 @@ pub fn isConnected(client: *const io.Client) bool {
     return client.conn.phase == .connected;
 }
 
+// ---------------------------------------------------------------------------
+// QUIC listener (server side)
+// ---------------------------------------------------------------------------
+//
+// The reference (quic-go / yggdrasil-go) builds its QUIC server certificate
+// from the node's Ed25519 identity key and sets `InsecureSkipVerify` on the
+// client, so peers never verify the certificate — node identity is proven by
+// the ironwood handshake that follows, not by TLS. zquic's `Server` can only
+// load RSA/ECDSA private keys (not Ed25519), so we use one static self-signed
+// P-256 certificate for every listener. This is interoperable: Go's client
+// accepts any cert (`InsecureSkipVerify: true`, `verifyTLSConnection` returns
+// nil) and our own client does not verify peers either.
+
+pub const serverCertPem: []const u8 =
+    "-----BEGIN CERTIFICATE-----\n" ++
+    "MIIBoDCCAUegAwIBAgIUUJFV1k/38AIspj5EtrPYW1vG0PgwCgYIKoZIzj0EAwIw\n" ++
+    "GDEWMBQGA1UEAwwNeWdnZHJhc2lsLnppZzAgFw0yNjA4MzAxMDM1MTVaGA8yMTI2\n" ++
+    "MDgwNjEwMzUxNVowGDEWMBQGA1UEAwwNeWdnZHJhc2lsLnppZzBZMBMGByqGSM49\n" ++
+    "AgEGCCqGSM49AwEHA0IABJ02Vhxglvma9gd/mG3yvcnY2G3efWwkSm6aYyoV5CDJ\n" ++
+    "DVwIa+3JeLlNg1sQ7R8baIo1Vd25drdBAZXecxdzxjCjbTBrMB0GA1UdDgQWBBS/\n" ++
+    "yx5d2ED+jsK2WXhhD/h749cFazAfBgNVHSMEGDAWgBS/yx5d2ED+jsK2WXhhD/h7\n" ++
+    "49cFazAPBgNVHRMBAf8EBTADAQH/MBgGA1UdEQQRMA+CDXlnZ2RyYXNpbC56aWcw\n" ++
+    "CgYIKoZIzj0EAwIDRwAwRAIgGgarw21L9vkBS01KudFCXzNrp0uVSpjBktwfQcCj\n" ++
+    "o90CIGJplh1vV9dsEJeRvgAfmY6HthxT93S3azdaprC6wkG/\n" ++
+    "-----END CERTIFICATE-----\n";
+
+pub const serverKeyPem: []const u8 =
+    "-----BEGIN EC PRIVATE KEY-----\n" ++
+    "MHcCAQEEIJiyU0dbRES3F4xyvt1Bhn8y1nZXSSe9ULSU7JnTRkeHoAoGCCqGSM49\n" ++
+    "AwEHoUQDQgAEnTZWHGCW+Zr2B3+YbfK9ydjYbd59bCRKbppjKhXkIMkNXAhr7cl4\n" ++
+    "uU2DWxDtHxtoijVV3bl2t0EBld5zF3PGMA==\n" ++
+    "-----END EC PRIVATE KEY-----\n";
+
+/// Create a raw-application-stream QUIC server bound to `0.0.0.0:port`. The
+/// caller drives it by `recvfrom` + `feedPacket` + `processPendingWork`, and
+/// scans `server.conns` for accepted (`.connected`) connections.
+pub fn createServer(gpa: std.mem.Allocator, port: u16) !*io.Server {
+    return try io.Server.init(gpa, .{
+        .port = port,
+        .cert_pem = serverCertPem,
+        .key_pem = serverKeyPem,
+        .www_dir = "",
+        .raw_application_streams = true,
+        .alpn = null,
+    });
+}
+
+pub fn destroyServer(gpa: std.mem.Allocator, server: *io.Server) void {
+    server.deinit();
+    gpa.destroy(server);
+}
+
+/// Cross-platform socket helpers, re-exported for the listener's recv loop.
+pub const compat = zquic.compat;
+
+/// Drain all currently-buffered UDP datagrams off the server socket and feed
+/// them into zquic. Non-blocking (`MSG_DONTWAIT`) so a datagram-less socket
+/// returns immediately instead of stalling the event loop — mirrors the
+/// outbound client's `drainQuicUdp`.
+pub fn serverDrainUdp(server: *io.Server, scratch: []u8) void {
+    while (true) {
+        var src: std.posix.sockaddr = undefined;
+        var srclen: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+        const n: isize = std.posix.system.recvfrom(
+            server.sock,
+            scratch.ptr,
+            scratch.len,
+            std.posix.MSG.DONTWAIT,
+            &src,
+            &srclen,
+        );
+        if (n <= 0) break;
+        var addr: compat.Address = undefined;
+        const copy = @min(@sizeOf(compat.Address), @sizeOf(std.posix.sockaddr));
+        @memcpy(std.mem.asBytes(&addr)[0..copy], std.mem.asBytes(&src)[0..copy]);
+        server.feedPacket(scratch[0..@intCast(n)], addr);
+    }
+}
+
+/// One full server drive: reset per-drive send/recv budgets, drain inbound
+/// UDP into zquic, then run pending work (STREAM sends, ACKs, loss recovery,
+/// idle/handshake reaping). Call once per tick, in this order.
+pub fn serverDrive(server: *io.Server, scratch: []u8) void {
+    server.resetDriveSendBudgets();
+    serverDrainUdp(server, scratch);
+    server.processPendingWork();
+}
+
+/// Whether `conn` is still referenced by `server`'s connection table. zquic
+/// frees a reaped `ConnState`, so an embedder holding a cached pointer MUST
+/// check this before dereferencing it.
+pub fn serverConnAlive(server: *io.Server, conn: *io.ConnState) bool {
+    for (&server.conns) |slot| {
+        if (slot) |c| {
+            if (c == conn) return true;
+        }
+    }
+    return false;
+}
+
 const testing = std.testing;
 
 test "zquic client constructs without sending" {

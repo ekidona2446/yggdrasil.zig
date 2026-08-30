@@ -86,6 +86,16 @@ pub fn assignAddressForAdapter(adapter: *TunAdapter, addr: node.Address, mtu: u1
     }
 }
 
+/// Assign an arbitrary IPv4/IPv6 address in CIDR notation (e.g. "10.99.0.1/24")
+/// to the interface — used for CKR tunnel addresses. On Windows this takes the
+/// adapter (addresses are assigned by LUID).
+pub fn assignCidrAddressForAdapter(adapter: *TunAdapter, cidr: []const u8) !void {
+    switch (builtin.os.tag) {
+        .windows => return backend.assignCidrAddress(&adapter.native, cidr),
+        else => return backend.assignCidrAddress(std.mem.sliceTo(&adapter.native.name, 0), cidr),
+    }
+}
+
 fn formatAddress(buf: []u8, bytes: *const [16]u8) ![]const u8 {
     var w: std.Io.Writer = .fixed(buf);
     try node.address.formatIpv6(bytes, &w);

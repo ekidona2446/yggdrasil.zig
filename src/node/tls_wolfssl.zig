@@ -43,6 +43,14 @@ pub extern "c" fn wolfSSL_Init() c_int;
 pub extern "c" fn wolfSSL_Cleanup() c_int;
 pub extern "c" fn wolfTLSv1_3_server_method() ?*WOLFSSL_METHOD;
 pub extern "c" fn wolfTLSv1_3_client_method() ?*WOLFSSL_METHOD;
+/// Version-flexible methods: negotiate the highest mutually-supported TLS
+/// version (1.0-1.3). The reference Go implementation dials/listens with
+/// MinVersion 1.2 / MaxVersion 1.3, so we constrain to that floor with
+/// `wolfSSL_CTX_SetMinVersion` below. TLS-1.2-only peers (e.g. wss:// links
+/// terminated by older reverse proxies) need the 1.2 fallback; a pure 1.3
+/// method rejects them with a "protocol version" alert.
+pub extern "c" fn wolfTLS_client_method() ?*WOLFSSL_METHOD;
+pub extern "c" fn wolfTLS_server_method() ?*WOLFSSL_METHOD;
 pub extern "c" fn wolfSSL_CTX_new(m: ?*WOLFSSL_METHOD) ?*WOLFSSL_CTX;
 pub extern "c" fn wolfSSL_CTX_free(ctx: ?*WOLFSSL_CTX) void;
 pub extern "c" fn wolfSSL_new(ctx: ?*WOLFSSL_CTX) ?*WOLFSSL;
@@ -73,8 +81,10 @@ pub extern "c" fn wolfSSL_CTX_use_certificate_buffer(ctx: ?*WOLFSSL_CTX, in: [*]
 pub extern "c" fn wolfSSL_CTX_use_PrivateKey_buffer(ctx: ?*WOLFSSL_CTX, in: [*]const u8, sz: c_long, format: c_int) c_int;
 pub extern "c" fn wolfSSL_CTX_set_verify(ctx: ?*WOLFSSL_CTX, mode: c_int, cb: ?*anyopaque) void;
 pub extern "c" fn wolfSSL_CTX_set_min_proto_version(ctx: ?*WOLFSSL_CTX, version: c_int) c_int;
+pub extern "c" fn wolfSSL_CTX_SetMinVersion(ctx: ?*WOLFSSL_CTX, version: c_int) c_int;
 
 pub const WOLFSSL_VERIFY_NONE: c_int = 0;
+pub const WOLFSSL_TLSV1_2: c_int = 3; // wolfssl/ssl.h `enum { ... WOLFSSL_TLSV1_2 = 3, WOLFSSL_TLSV1_3 = 4 }`
 
 // ---------------------------------------------------------------------------
 // SNI (Server Name Indication)
@@ -254,14 +264,17 @@ pub fn globalDeinit() void {
 }
 
 pub fn newServerCtx() !*WOLFSSL_CTX {
-    const method = wolfTLSv1_3_server_method() orelse return TlsError.CtxCreateFailed;
+    const method = wolfTLS_server_method() orelse return TlsError.CtxCreateFailed;
     const ctx = wolfSSL_CTX_new(method) orelse return TlsError.CtxCreateFailed;
+    // Match the reference's TLS 1.2 floor (see the method decl above).
+    _ = wolfSSL_CTX_SetMinVersion(ctx, WOLFSSL_TLSV1_2);
     return ctx;
 }
 
 pub fn newClientCtx() !*WOLFSSL_CTX {
-    const method = wolfTLSv1_3_client_method() orelse return TlsError.CtxCreateFailed;
+    const method = wolfTLS_client_method() orelse return TlsError.CtxCreateFailed;
     const ctx = wolfSSL_CTX_new(method) orelse return TlsError.CtxCreateFailed;
+    _ = wolfSSL_CTX_SetMinVersion(ctx, WOLFSSL_TLSV1_2);
     return ctx;
 }
 
