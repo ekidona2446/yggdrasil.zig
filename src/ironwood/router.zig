@@ -33,8 +33,15 @@ const Instant = timemod.Instant;
 
 const KeyMap = std.AutoHashMapUnmanaged;
 
-/// Latency assumed for a peer whose RTT we haven't measured yet (5 s in ns).
-const UNKNOWN_LATENCY_NS: u64 = 5 * std.time.ns_per_s;
+/// Latency assumed for a peer whose RTT we haven't measured yet.
+///
+/// Mirrors ironwood's `routerUnknownLatency = time.Duration(^uint32(0))`
+/// (network/router.go:39) exactly -- 4294967295 ns. The value is not arbitrary:
+/// `_getCost` reports `lag.Milliseconds()`, so this constant fixes the advertised
+/// cost of an unmeasured peer at 4294. A rounder figure here (5 s -> 5000)
+/// produced `getpeers` output that did not match the reference for exactly those
+/// peers, and fed a different weight into parent selection.
+const UNKNOWN_LATENCY_NS: u64 = std.math.maxInt(u32);
 
 /// Unique identifier for a peer connection.
 pub const PeerId = u64;
@@ -479,6 +486,19 @@ pub const Router = struct {
         return self.last_rtts.get(peer_id) orelse 0;
     }
 
+    /// Record the instant a sigReq for `peer_id` is handed to the transport.
+    ///
+    /// Ironwood stamps `peer.srst` from the `done` callback of
+    /// `peerWriter.sendPacket` (network/peers.go:215-223), i.e. *after* the frame
+    /// has been written. Stamping it when the router merely decides to send folds
+    /// our own dispatch latency into the measured round trip, which is what made
+    /// the reported latency run well above the reference's for the same link.
+    /// An allocation failure here only costs one RTT sample, so it is not
+    /// propagated into the write path.
+    pub fn markSigReqSent(self: *Router, peer_id: PeerId) void {
+        self.sig_req_times.put(self.gpa, peer_id, Instant.now()) catch {};
+    }
+
     pub fn getCost(self: *const Router, peer_id: PeerId) u64 {
         const lag = self.lags.get(peer_id) orelse UNKNOWN_LATENCY_NS;
         const c = lag / std.time.ns_per_ms;
@@ -565,13 +585,13 @@ pub const Router = struct {
             try pairs.append(self.gpa, .{ .key = entry.key_ptr.*, .ids = try ids.toOwnedSlice(self.gpa) });
         }
 
-        const now = Instant.now();
         for (pairs.items) |pair| {
             const req = self.newReq();
             try self.requests.put(self.gpa, pair.key, req);
             for (pair.ids) |peer_id| {
                 _ = self.responded.remove(peer_id);
-                try self.sig_req_times.put(self.gpa, peer_id, now);
+                // The send timestamp is taken by markSigReqSent when the frame
+                // actually reaches the transport, not here.
                 try actions.append(.{ .send_sig_req = .{
                     .peer_id = peer_id,
                     .req = .{ .seq = req.seq, .nonce = req.nonce },
@@ -1275,7 +1295,6 @@ pub const Router = struct {
         }
         const req = self.requests.get(key).?;
         _ = self.responded.remove(peer_id);
-        try self.sig_req_times.put(self.gpa, peer_id, Instant.now());
         try actions.append(.{ .send_sig_req = .{ .peer_id = peer_id, .req = .{ .seq = req.seq, .nonce = req.nonce } } });
 
         if (self.blooms.getSendBloom(&key)) |bloom| {
@@ -1511,6 +1530,24 @@ test "add and remove peer cleans up state" {
     const rm_actions = try router.removePeer(1, peer_key, 7);
     defer deinitActions(gpa, rm_actions);
     try testing.expect(!router.peers.contains(peer_key));
+}
+
+test "unmeasured peer advertises ironwood's unknown-latency cost" {
+    const gpa = testing.allocator;
+    var router = try makeRouter(gpa);
+    defer router.deinit();
+
+    const peer_key = [_]u8{0x77} ** 32;
+    const entry = PeerEntry{ .id = 1, .key = peer_key, .port = 3, .prio = 0, .order = 0 };
+    const add_actions = try router.addPeer(entry);
+    defer deinitActions(gpa, add_actions);
+
+    // ironwood: routerUnknownLatency = time.Duration(^uint32(0)) ns, and
+    // _getCost reports lag.Milliseconds() with a floor of 1 -> 4294.
+    try testing.expectEqual(@as(u64, std.math.maxInt(u32)), UNKNOWN_LATENCY_NS);
+    try testing.expectEqual(@as(u64, 4294), router.getCost(1));
+    // No sigReq has been answered yet, so no latency is reported at all.
+    try testing.expectEqual(@as(u64, 0), router.getLatency(1));
 }
 
 test "send_traffic with no path initiates lookup and caches packet" {

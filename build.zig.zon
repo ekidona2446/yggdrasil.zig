@@ -18,12 +18,12 @@
             .lazy = true,
         },
         .zquic = .{
-            .url = "https://github.com/zigstack/zquic/archive/refs/heads/master.tar.gz",
+            .url = "https://github.com/ekidona2446/zquic/archive/refs/heads/master.tar.gz",
 			.hash = "zquic-1.7.86-2zRc1I2dGQAI1M0gg19eycqe5WRZwvwJx97CECAhYreO"
         },
         .libwebsockets = .{
-            .url = "https://github.com/warmcat/libwebsockets/archive/refs/heads/main.tar.gz",
-            .hash = "N-V-__8AAPTNeAQqu8ldwiCJPY7Yb5ayB5VnX76kruIcyS_8",
+            .url = "https://github.com/warmcat/libwebsockets/archive/refs/tags/sai-ca499cfb5.tar.gz",
+            .hash = "N-V-__8AAHUfeQQr_r4IN0lY9Ied-Vovds3OPCWwSHteOrmA",
         },
     },
     .paths = .{

@@ -269,32 +269,28 @@ fn WsStream(comptime Inner: type) type {
 /// QUIC stream over zquic's raw-application-stream client.
 const QuicStream = struct {
     gpa: std.mem.Allocator,
-    client: *node.quic.io.Client,
+    client: *node.quic.Client,
     stream_id: u64,
     recv_off: usize = 0,
     scratch: [2048]u8 = undefined,
 
+    fn fd(self: *const QuicStream) Fd {
+        return @intCast(self.client.sock);
+    }
+
     fn pump(self: *QuicStream) void {
-        while (true) {
-            const n: isize = std.posix.system.recvfrom(
-                self.client.sock,
-                self.scratch[0..].ptr,
-                self.scratch.len,
-                std.posix.MSG.DONTWAIT,
-                null,
-                null,
-            );
-            if (n <= 0) break;
-            self.client.feedPacket(self.scratch[0..@intCast(n)]);
-        }
-        self.client.processPendingWork(self.client.conn.peer);
-        self.client.flushDeferredAck();
+        // Non-blocking drain; the socket is created non-blocking by
+        // `node.quic.createClient`, so no MSG_DONTWAIT (which does not exist
+        // on Windows) is needed.
+        _ = node.quic.clientDrainUdp(self.client, &self.scratch);
+        self.client.quic.processPendingWork(self.client.peer);
+        self.client.quic.flushDeferredAck();
     }
 
     fn read(self: *QuicStream, buf: []u8) !usize {
         while (true) {
             self.pump();
-            if (self.client.rawAppRecvBuffer(self.stream_id)) |got| {
+            if (self.client.quic.rawAppRecvBuffer(self.stream_id)) |got| {
                 if (got.len > self.recv_off) {
                     const fresh = got[self.recv_off..];
                     const n = @min(buf.len, fresh.len);
@@ -303,7 +299,7 @@ const QuicStream = struct {
                     return n;
                 }
             }
-            if (!waitReadable(self.client.sock, 2000)) return error.Timeout;
+            if (!waitReadable(self.fd(), 2000)) return error.Timeout;
         }
     }
 
@@ -311,15 +307,15 @@ const QuicStream = struct {
         var off: usize = 0;
         while (off < buf.len) {
             self.pump();
-            const n = self.client.sendRawStreamData(self.stream_id, off, buf[off..], false);
+            const n = self.client.quic.sendRawStreamData(self.stream_id, off, buf[off..], false);
             if (n == 0) {
-                if (!waitReadable(self.client.sock, 2000)) return error.Timeout;
+                if (!waitReadable(self.fd(), 2000)) return error.Timeout;
                 continue;
             }
             off += n;
         }
-        self.client.processPendingWork(self.client.conn.peer);
-        self.client.flushDeferredAck();
+        self.client.quic.processPendingWork(self.client.peer);
+        self.client.quic.flushDeferredAck();
     }
 
     fn deinit(self: *QuicStream) void {
@@ -564,7 +560,7 @@ pub fn main(init: std.process.Init) !void {
     const t0 = monotonicNanos();
 
     if (is_scheme(scheme, "quic")) {
-        try runQuic(gpa, &our_id, password, parsed.host, ipv4.bytes, ipv4.port, t0);
+        try runQuic(gpa, &our_id, password, parsed.host, .{ .ip4 = ipv4 }, t0);
         return;
     }
 
@@ -626,12 +622,11 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-fn runQuic(gpa: std.mem.Allocator, our_id: *const Crypto, password: []const u8, host: []const u8, ip: [4]u8, port: u16, t0: u64) !void {
-    const client = node.quic.createClient(gpa, host, port) catch |e| {
+fn runQuic(gpa: std.mem.Allocator, our_id: *const Crypto, password: []const u8, host: []const u8, peer: std.Io.net.IpAddress, t0: u64) !void {
+    const client = node.quic.createClient(gpa, host, peer) catch |e| {
         std.debug.print("FAIL|quic_create|{s}\n", .{@errorName(e)});
         return;
     };
-    node.quic.setPeerIpv4(client, ip, port);
     node.quic.startHandshake(client) catch |e| {
         std.debug.print("FAIL|quic_start|{s}\n", .{@errorName(e)});
         node.quic.destroyClient(gpa, client);
@@ -651,7 +646,7 @@ fn runQuic(gpa: std.mem.Allocator, our_id: *const Crypto, password: []const u8, 
         if (!waitReadable(client.sock, 100)) continue;
     }
 
-    const sid = client.tryOpenLocalBidiStream() catch |e| {
+    const sid = client.quic.tryOpenLocalBidiStream() catch |e| {
         std.debug.print("FAIL|quic_stream|{s}\n", .{@errorName(e)});
         stream.deinit();
         return;

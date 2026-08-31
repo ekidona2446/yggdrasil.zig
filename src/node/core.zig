@@ -628,6 +628,21 @@ pub const RouterPeerInfo = struct {
     latency_ns: u64,
 };
 
+/// Round a duration in nanoseconds to the nearest multiple of `unit`, ties away
+/// from zero -- the semantics of Go's `time.Duration.Round` for non-negative
+/// values.
+fn roundDuration(ns: u64, unit: u64) u64 {
+    if (unit == 0) return ns;
+    return (ns + unit / 2) / unit * unit;
+}
+
+/// Ironwood's `Debug.GetPeers` reports
+/// `peer.srrt.Sub(peer.srst).Round(time.Millisecond / 100)` (network/debug.go:85),
+/// i.e. the last sigReq->sigRes round trip quantised to 10 us. Reporting the raw
+/// nanosecond figure instead made our `getpeers` latency disagree with the
+/// reference on every peer.
+const admin_latency_quantum_ns: u64 = std.time.ns_per_ms / 100;
+
 pub fn getRouterPeers(self: *Core, gpa: std.mem.Allocator) ![]RouterPeerInfo {
     var list = std.ArrayListUnmanaged(RouterPeerInfo).empty;
     errdefer list.deinit(gpa);
@@ -642,7 +657,7 @@ pub fn getRouterPeers(self: *Core, gpa: std.mem.Allocator) ![]RouterPeerInfo {
                 .port = pe.port,
                 .priority = pe.prio,
                 .cost = self.router.getCost(pe.id),
-                .latency_ns = self.router.getLatency(pe.id),
+                .latency_ns = roundDuration(self.router.getLatency(pe.id), admin_latency_quantum_ns),
             }) catch |err| {
                 list.deinit(gpa);
                 return err;
@@ -682,6 +697,18 @@ pub fn freeDiscovered(gpa: std.mem.Allocator, items: []PublicKey) void {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "admin latency is quantised like ironwood's Debug.GetPeers" {
+    // Go: peer.srrt.Sub(peer.srst).Round(time.Millisecond / 100), i.e. 10 us.
+    try testing.expectEqual(@as(u64, 10_000), admin_latency_quantum_ns);
+    try testing.expectEqual(@as(u64, 0), roundDuration(0, admin_latency_quantum_ns));
+    try testing.expectEqual(@as(u64, 0), roundDuration(4_999, admin_latency_quantum_ns));
+    try testing.expectEqual(@as(u64, 10_000), roundDuration(5_000, admin_latency_quantum_ns));
+    try testing.expectEqual(@as(u64, 10_000), roundDuration(14_999, admin_latency_quantum_ns));
+    try testing.expectEqual(@as(u64, 20_000), roundDuration(15_000, admin_latency_quantum_ns));
+    try testing.expectEqual(@as(u64, 650_000), roundDuration(654_321, admin_latency_quantum_ns));
+    try testing.expectEqual(@as(u64, 650_000), roundDuration(650_000, admin_latency_quantum_ns));
+}
 
 test "core init and self key" {
     const gpa = testing.allocator;

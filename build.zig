@@ -11,10 +11,39 @@ const WolfsslMode = enum {
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // Default to ReleaseSafe rather than Zig's usual Debug default.
+    //
+    // This matters more than it looks. The ironwood control plane signs an
+    // Ed25519 response for every sigReq, and the sigReq/sigRes round trip is
+    // what `getPeers` reports as `latency` and what `Router.getCost` turns into
+    // the parent-selection cost. In Debug, std.crypto's Ed25519 signature costs
+    // ~2.3 ms against ~59 us optimized -- a 40x penalty that showed up directly
+    // as inflated latency and cost, and would distort routing on a real mesh.
+    // ReleaseSafe keeps the safety checks (this daemon parses untrusted network
+    // input) while compiling the crypto and hot paths properly.
+    //
+    // Note this is a real `-Doptimize` option, not `standardOptimizeOption`'s
+    // `preferred_optimize_mode`: that one only changes what `-Drelease` maps to
+    // and still leaves the default at Debug, which is exactly the footgun that
+    // produced the numbers above.
+    const optimize = b.option(
+        std.builtin.OptimizeMode,
+        "optimize",
+        "Prioritize performance, safety, or binary size (default: ReleaseSafe)",
+    ) orelse .ReleaseSafe;
 
-    const wolfssl_mode = b.option(WolfsslMode, "wolfssl", "wolfSSL source: bundled (default) or system") orelse .bundled;
-    const wolfssl_prefix = b.option([]const u8, "wolfssl-prefix", "Path to a wolfSSL install prefix containing include/ and lib/libwolfssl.a");
+    // Tests default to Debug so `zig build test` keeps every safety check and
+    // catches undefined behaviour that ReleaseSafe would also catch but
+    // ReleaseFast/Small would not. Override with -Dtest-optimize=... to run the
+    // suite in the same mode you ship.
+    const test_optimize = b.option(
+        std.builtin.OptimizeMode,
+        "test-optimize",
+        "Optimization mode for the test binaries (default: Debug)",
+    ) orelse .Debug;
+
+    const wolfssl_mode = b.option(WolfsslMode, "wolfssl", "WolfSSL source: bundled (default) or system") orelse .bundled;
+    const wolfssl_prefix = b.option([]const u8, "wolfssl-prefix", "Path to a WolfSSL install prefix containing include/ and lib/libwolfssl.a");
 
     // ---- dependencies -----------------------------------------------------
     const libxev = b.dependency("libxev", .{
@@ -67,7 +96,7 @@ pub fn build(b: *std.Build) void {
     node_mod.addImport("zquic", zquic_mod);
 
     const wolfssl = configureWolfssl(b, target, wolfssl_mode, wolfssl_prefix);
-    const lws = configureLibwebsockets(b, target);
+    const lws = configureLibwebsockets(b, target, wolfssl.build_step);
 
     // ---- yggdrasil executable ---------------------------------------------
     const exe = b.addExecutable(.{
@@ -131,7 +160,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/ironwood/ironwood.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = test_optimize,
         }),
     });
     ironwood_tests.root_module.addImport("xev", xev_mod);
@@ -144,7 +173,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/util/util.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = test_optimize,
         }),
     });
     const run_util_tests = b.addRunArtifact(util_tests);
@@ -154,7 +183,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/async/async.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = test_optimize,
         }),
     });
     async_tests.root_module.addImport("xev", xev_mod);
@@ -165,7 +194,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/node/node.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = test_optimize,
         }),
     });
     node_tests.root_module.addImport("ironwood", ironwood);
@@ -182,6 +211,9 @@ pub fn build(b: *std.Build) void {
 const WolfsslPaths = struct {
     include_dir: std.Build.LazyPath,
     static_lib: std.Build.LazyPath,
+    /// The step that produces the archive, so other C dependency builds can be
+    /// ordered after it. Null when a prebuilt -Dwolfssl-prefix is in use.
+    build_step: ?*std.Build.Step = null,
 };
 
 fn configureWolfssl(
@@ -252,6 +284,7 @@ fn configureWolfssl(
     return .{
         .include_dir = out_dir.path(b, "install/include"),
         .static_lib = out_dir.path(b, "install/lib/libwolfssl.a"),
+        .build_step = &run.step,
     };
 }
 
@@ -280,7 +313,13 @@ const LwsPaths = struct {
     static_lib: std.Build.LazyPath,
 };
 
-fn configureLibwebsockets(b: *std.Build, target: std.Build.ResolvedTarget) LwsPaths {
+/// `after`, when non-null, is another C dependency's build step. wolfSSL and
+/// libwebsockets are both large C builds and Zig would otherwise run them
+/// concurrently; on a small machine (2 GB RAM) that gets them both killed by
+/// the OOM killer partway through, which looks like a mysterious build failure
+/// with no compiler error in the log. Serializing them costs a little wall time
+/// on big machines and makes the build actually finish on small ones.
+fn configureLibwebsockets(b: *std.Build, target: std.Build.ResolvedTarget, after: ?*std.Build.Step) LwsPaths {
     if (!target.query.isNative()) {
         @panic("bundled libwebsockets uses cmake for the native host only");
     }
@@ -319,6 +358,7 @@ fn configureLibwebsockets(b: *std.Build, target: std.Build.ResolvedTarget) LwsPa
         ,
         "build-libwebsockets",
     });
+    if (after) |step| run.step.dependOn(step);
     run.addDirectoryArg(lws_dep.path("."));
     const out_dir = run.addOutputDirectoryArg("libwebsockets");
     return .{

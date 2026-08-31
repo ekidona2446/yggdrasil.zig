@@ -14,6 +14,7 @@
 //! config files losslessly, which is what actually matters in practice.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Ed25519 = std.crypto.sign.Ed25519;
 const ironwood = @import("ironwood");
 const crypto = ironwood.crypto;
@@ -122,6 +123,43 @@ pub const Config = struct {
 
     /// Build a fresh default configuration with a newly generated Ed25519
     /// identity, suitable for `--genconf`. All memory is owned by `gpa`.
+/// Platform default `[[multicast_interfaces]]` entries, mirroring
+/// yggdrasil-go's `src/config/defaults_*.go`.
+///
+/// Every platform except Apple's gets a single match-all entry. macOS is the
+/// odd one out in the reference: it beacons on `en*` and `bridge*` and carries
+/// an explicit entry turning `awdl0` off, because multicast on Apple's
+/// peer-to-peer Wi-Fi interface misbehaves. Emitting the same three entries
+/// keeps a generated config portable instead of quietly beaconing on an
+/// interface the reference deliberately avoids.
+///
+/// Note the pattern syntax: yggdrasil-go's field is `Regex` and is matched with
+/// `regexp.MatchString`, ours is `filter` and is matched with `globMatch`, so
+/// its `".*"` is written `"*"` here. See the caveat in multicast.zig.
+fn defaultMulticastInterfaces(gpa: std.mem.Allocator) ![]MulticastInterfaceConfig {
+    return defaultMulticastInterfacesFor(gpa, builtin.os.tag);
+}
+
+/// Split out from `defaultMulticastInterfaces` so the per-OS table can be
+/// exercised on any build host: the macOS entries cannot otherwise be checked
+/// without a macOS machine.
+fn defaultMulticastInterfacesFor(gpa: std.mem.Allocator, os_tag: std.Target.Os.Tag) ![]MulticastInterfaceConfig {
+    switch (os_tag) {
+        .macos, .ios, .maccatalyst, .tvos, .visionos, .watchos => {
+            const mc = try gpa.alloc(MulticastInterfaceConfig, 3);
+            mc[0] = .{ .filter = try gpa.dupe(u8, "en*") };
+            mc[1] = .{ .filter = try gpa.dupe(u8, "bridge*") };
+            mc[2] = .{ .filter = try gpa.dupe(u8, "awdl0"), .beacon = false, .listen = false };
+            return mc;
+        },
+        else => {
+            const mc = try gpa.alloc(MulticastInterfaceConfig, 1);
+            mc[0] = .{ .filter = try gpa.dupe(u8, "*") };
+            return mc;
+        },
+    }
+}
+
     pub fn generateDefault(gpa: std.mem.Allocator) !Config {
         const id = crypto.Crypto.generate();
         var hex_buf = try gpa.alloc(u8, 128);
@@ -135,8 +173,7 @@ pub const Config = struct {
         const listen = try gpa.alloc([]const u8, 1);
         listen[0] = try gpa.dupe(u8, "tcp://0.0.0.0:0");
 
-        const mc = try gpa.alloc(MulticastInterfaceConfig, 1);
-        mc[0] = .{ .filter = try gpa.dupe(u8, "*") };
+        const mc = try defaultMulticastInterfaces(gpa);
 
         return .{
             .private_key = hex_buf,
@@ -685,4 +722,38 @@ test "parseToml handles empty arrays and comments" {
     try testing.expect(cfg.firewall.enable);
     try testing.expectEqual(@as(usize, 3), cfg.firewall.open_tcp.len);
     try testing.expectEqual(@as(usize, 0), cfg.firewall.open_udp.len);
+}
+
+test "multicast defaults: single match-all entry on Linux and friends" {
+    const gpa = std.testing.allocator;
+    for ([_]std.Target.Os.Tag{ .linux, .freebsd, .openbsd, .windows, .netbsd }) |tag| {
+        const mc = try Config.defaultMulticastInterfacesFor(gpa, tag);
+        defer {
+            for (mc) |m| gpa.free(m.filter);
+            gpa.free(mc);
+        }
+        try std.testing.expectEqual(@as(usize, 1), mc.len);
+        try std.testing.expectEqualStrings("*", mc[0].filter);
+        try std.testing.expect(mc[0].beacon);
+        try std.testing.expect(mc[0].listen);
+    }
+}
+
+test "multicast defaults: macOS beacons on en*/bridge* and disables awdl0" {
+    // yggdrasil-go's defaults_darwin.go carries three entries and explicitly
+    // turns off AWDL; a generated config that beaconed there would diverge from
+    // the reference on the one platform that needs the exception.
+    const gpa = std.testing.allocator;
+    const mc = try Config.defaultMulticastInterfacesFor(gpa, .macos);
+    defer {
+        for (mc) |m| gpa.free(m.filter);
+        gpa.free(mc);
+    }
+    try std.testing.expectEqual(@as(usize, 3), mc.len);
+    try std.testing.expectEqualStrings("en*", mc[0].filter);
+    try std.testing.expect(mc[0].beacon and mc[0].listen);
+    try std.testing.expectEqualStrings("bridge*", mc[1].filter);
+    try std.testing.expect(mc[1].beacon and mc[1].listen);
+    try std.testing.expectEqualStrings("awdl0", mc[2].filter);
+    try std.testing.expect(!mc[2].beacon and !mc[2].listen);
 }

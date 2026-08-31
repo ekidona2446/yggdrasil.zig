@@ -276,6 +276,63 @@ const WriteItem = struct {
 // PeerConn: one TCP connection to/from a peer, post-handshake
 // ---------------------------------------------------------------------------
 
+/// `setsockopt(2)` from ws2_32, for the Windows branch of setTcpNoDelay.
+/// SOCKET is UINT_PTR, so `usize` is the right width on every supported
+/// Windows ABI.
+const win_setsockopt = if (builtin.os.tag == .windows) struct {
+    extern "ws2_32" fn setsockopt(
+        s: usize,
+        level: i32,
+        optname: i32,
+        optval: ?*const anyopaque,
+        optlen: i32,
+    ) i32;
+}.setsockopt else void;
+
+/// IPPROTO_TCP and TCP_NODELAY are 6 and 1 in every <netinet/tcp.h> we target
+/// (Linux, macOS, FreeBSD/OpenBSD/NetBSD) and in winsock2.h.
+///
+/// Zig's std does NOT give us the names portably: `std.posix.TCP` and
+/// `std.posix.IPPROTO` are only defined for Linux and emscripten, and are
+/// `void` everywhere else, so `std.posix.TCP.NODELAY` is a compile error on
+/// macOS and the BSDs. Hence the literals.
+const IPPROTO_TCP: u32 = 6;
+const TCP_NODELAY: u32 = 1;
+
+/// Turn off Nagle's algorithm on a link socket.
+///
+/// Go's `net` package sets TCP_NODELAY on every TCP connection it creates, so
+/// yggdrasil-go never sees Nagle delays. We did not set it at all, and the
+/// consequence was measurable rather than theoretical: ironwood's control
+/// frames (sigReq/sigRes, announces, path lookups) are tiny, so Nagle holds
+/// them until outstanding data is ACKed -- while the peer does the same under
+/// delayed-ACK. That is the classic ~40 ms stall.
+///
+/// On a veth pair, one sigReq/sigRes round trip measured 20-56 ms between two
+/// yggdrasil.zig nodes against 0.5 ms between two yggdrasil-go nodes. Because
+/// the RTT feeds `Router.getCost`, and cost feeds parent selection, the stall
+/// distorted routing decisions as well as the `getPeers` latency figure.
+///
+/// A failure here is not fatal: the link still works, only slower.
+fn setTcpNoDelay(tcp: xev.TCP) void {
+    var on: c_int = 1;
+    if (builtin.os.tag == .windows) {
+        // std.posix.setsockopt is a hard compile error on Windows ("use std.Io
+        // instead"), and xev's fd there is a HANDLE rather than a socket_t.
+        _ = win_setsockopt(
+            @intFromPtr(tcp.fd),
+            @intCast(IPPROTO_TCP),
+            @intCast(TCP_NODELAY),
+            &on,
+            @sizeOf(c_int),
+        );
+    } else {
+        std.posix.setsockopt(tcp.fd, IPPROTO_TCP, TCP_NODELAY, std.mem.asBytes(&on)) catch |err| {
+            logInfo("setsockopt(TCP_NODELAY) failed: {}", .{err});
+        };
+    }
+}
+
 const PeerConn = struct {
     manager: *NetworkManager,
     tcp: xev.TCP,
@@ -465,7 +522,7 @@ const DialState = struct {
 const QuicLink = struct {
     manager: *NetworkManager,
     conn: *PeerConn,
-    client: *quic_mod.io.Client,
+    client: *quic_mod.Client,
     host: []u8,
     options: LinkOptions,
     stream_id: u64 = 0,
@@ -489,7 +546,7 @@ const QuicSrvConn = struct {
     manager: *NetworkManager,
     conn: *PeerConn,
     listener: *QuicServerListener,
-    server: *quic_mod.io.Server,
+    server: *quic_mod.Server,
     quic_conn: *quic_mod.io.ConnState,
     stream_id: u64 = 0,
     stream_found: bool = false,
@@ -504,7 +561,7 @@ const QuicSrvConn = struct {
 /// `PeerConn`s, and pumps raw-app STREAM bytes into the ironwood path.
 const QuicServerListener = struct {
     manager: *NetworkManager,
-    server: *quic_mod.io.Server,
+    server: *quic_mod.Server,
     tick: xev.Timer,
     tick_c: xev.Completion = undefined,
     recv_scratch: [2048]u8 = undefined,
@@ -997,6 +1054,9 @@ pub const NetworkManager = struct {
 
     fn spawnConn(self: *NetworkManager, tcp: xev.TCP, options: LinkOptions, dial: ?*DialState) !void {
         if (dial) |d| refDial(d);
+        // Both directions funnel through here, so this is the one place that
+        // guarantees every TCP/TLS/WS link is Nagle-free.
+        if (!options.use_quic) setTcpNoDelay(tcp);
         const conn = try self.gpa.create(PeerConn);
         conn.* = .{
             .manager = self,
@@ -1343,27 +1403,43 @@ pub const NetworkManager = struct {
             return err;
         };
         defer self.gpa.free(addrs);
-        var ip4: ?[4]u8 = null;
-        var use_port: u16 = port;
+        // Prefer IPv4 (cheaper MTU/fragmentation behaviour on most paths) but
+        // fall back to IPv6 instead of giving up: a large share of the public
+        // peer list is IPv6-only, and the previous version of this function
+        // returned `NoAddresses` for exactly those entries.
+        var peer: ?std.Io.net.IpAddress = null;
         for (addrs) |a| {
-            switch (a) {
-                .ip4 => |v| {
-                    ip4 = v.bytes;
-                    use_port = v.port;
-                    break;
-                },
-                else => {},
+            if (a == .ip4) {
+                peer = a;
+                break;
             }
         }
-        const octets = ip4 orelse return error.NoAddresses;
+        if (peer == null) {
+            for (addrs) |a| {
+                if (a == .ip6) {
+                    peer = a;
+                    break;
+                }
+            }
+        }
+        const target = peer orelse return error.NoAddresses;
 
-        const client = try quic_mod.createClient(self.gpa, host, use_port);
+        const client = try quic_mod.createClient(self.gpa, host, target);
         errdefer quic_mod.destroyClient(self.gpa, client);
-        quic_mod.setPeerIpv4(client, octets, use_port);
         try quic_mod.startHandshake(client);
-        logInfo("quic://{s}:{d} Initial sent to {d}.{d}.{d}.{d}", .{
-            host, use_port, octets[0], octets[1], octets[2], octets[3],
-        });
+        {
+            var ip_buf: [48]u8 = undefined;
+            var w = std.Io.Writer.fixed(&ip_buf);
+            switch (target) {
+                .ip4 => |v| w.print("{d}.{d}.{d}.{d}", .{ v.bytes[0], v.bytes[1], v.bytes[2], v.bytes[3] }) catch {},
+                .ip6 => |v| {
+                    w.writeByte('[') catch {};
+                    node.address.formatIpv6(&v.bytes, &w) catch {};
+                    w.writeByte(']') catch {};
+                },
+            }
+            logInfo("quic://{s}:{d} Initial sent to {s}", .{ host, client.peer.getPort(), ip_buf[0..w.end] });
+        }
 
         const conn = try self.gpa.create(PeerConn);
         errdefer self.gpa.destroy(conn);
@@ -1403,24 +1479,16 @@ pub const NetworkManager = struct {
         link.tick.run(self.loop, &link.tick_c, 20, QuicLink, link, onQuicTick);
     }
 
-    fn drainQuicUdp(_: *NetworkManager, link: *QuicLink) void {
-        // Portable non-blocking receive. The node always links libc (wolfSSL and
-        // libwebsockets), so `std.posix.system.recvfrom` resolves to libc's
-        // `recvfrom` on every POSIX target -- unlike the previous Linux-only
-        // `std.os.linux.recvfrom` syscall, which would not even compile on
-        // macOS/*BSD/Windows. `MSG_DONTWAIT` makes a datagram-less socket return
-        // immediately instead of stalling the event loop.
-        while (true) {
-            const n: isize = std.posix.system.recvfrom(
-                link.client.sock,
-                link.recv_scratch[0..].ptr,
-                link.recv_scratch.len,
-                std.posix.MSG.DONTWAIT,
-                null,
-                null,
-            );
-            if (n <= 0) break;
-            link.client.feedPacket(link.recv_scratch[0..@intCast(n)]);
+    fn drainQuicUdp(self: *NetworkManager, link: *QuicLink) void {
+        // Non-blocking drain. Zig 0.16 has no `std.posix.recvfrom` and no
+        // `std.posix.MSG`, so the receive lives in `udp_io.zig`, which binds
+        // libc's `recvfrom(3)` (Winsock's on Windows) and relies on the socket
+        // being non-blocking rather than on Linux's `MSG_DONTWAIT`. A false
+        // return means the kernel rejected the socket; drop the link rather
+        // than spinning forever.
+        if (!quic_mod.clientDrainUdp(link.client, &link.recv_scratch)) {
+            logInfo("quic://{s} socket error, closing link", .{link.host});
+            self.closeQuic(link);
         }
     }
 
@@ -1437,11 +1505,11 @@ pub const NetworkManager = struct {
 
     fn pumpQuic(self: *NetworkManager, link: *QuicLink) void {
         if (link.closing) return;
-        link.client.processPendingWork(link.client.conn.peer);
-        link.client.flushDeferredAck();
+        link.client.quic.processPendingWork(link.client.peer);
+        link.client.quic.flushDeferredAck();
 
         if (!link.stream_opened and quic_mod.isConnected(link.client)) {
-            const sid = link.client.tryOpenLocalBidiStream() catch |err| {
+            const sid = link.client.quic.tryOpenLocalBidiStream() catch |err| {
                 logInfo("quic://{s} open stream failed: {}", .{ link.host, err });
                 return;
             };
@@ -1454,7 +1522,7 @@ pub const NetworkManager = struct {
         }
 
         if (link.stream_opened) {
-            if (link.client.rawAppRecvBuffer(link.stream_id)) |got| {
+            if (link.client.quic.rawAppRecvBuffer(link.stream_id)) |got| {
                 if (got.len > link.recv_off) {
                     const fresh = got[link.recv_off..];
                     link.conn.read_buf.appendSlice(self.gpa, fresh) catch return;
@@ -1485,7 +1553,13 @@ pub const NetworkManager = struct {
     /// listen URI) is taken by value; on success its heap slices are owned by
     /// the listener, otherwise the caller's `errdefer` frees them.
     fn addQuicListener(self: *NetworkManager, options: LinkOptions, port: u16) !void {
-        const server = try quic_mod.createServer(self.gpa, port);
+        // wolfSSL must be initialised before we can mint the listener's
+        // identity; `ensureTlsState` is idempotent and is what `tls://` uses.
+        _ = try self.ensureTlsState();
+        var key_hex_buf: [64]u8 = undefined;
+        const key_hex = std.fmt.bufPrint(&key_hex_buf, "{x}", .{self.our_id.public_key}) catch unreachable;
+
+        const server = try quic_mod.createServer(self.gpa, port, key_hex);
         errdefer quic_mod.destroyServer(self.gpa, server);
 
         const listener = try self.gpa.create(QuicServerListener);
@@ -1531,7 +1605,7 @@ pub const NetworkManager = struct {
     /// Find freshly `.connected` zquic conns that we haven't wrapped in a
     /// `PeerConn` yet and do so.
     fn quicSrvPromoteNew(self: *NetworkManager, listener: *QuicServerListener) void {
-        for (&listener.server.conns) |*slot| {
+        for (&listener.server.quic.conns) |*slot| {
             const qconn = slot.* orelse continue;
             if (qconn.phase != .connected) continue;
             // Already promoted?
@@ -1855,6 +1929,12 @@ pub const NetworkManager = struct {
     fn queueWriteImpl(conn: *PeerConn, data: []u8) void {
         var payload = data;
         const packet_type: ?wire.PacketType = if (wire.decodeFrame(payload)) |decoded| decoded.packet_type else |_| null;
+        // Mirror ironwood, which stamps the sigReq send time from the writer's
+        // `done` callback rather than when the router queues the action; see
+        // Router.markSigReqSent.
+        if (packet_type) |pt| {
+            if (pt == .proto_sig_req) conn.manager.core.router.markSigReqSent(conn.peer_id);
+        }
         if (conn.use_ws and conn.ws_handshake_done) {
             const framed = (if (conn.inbound)
                 ws.encodeServerFrame(conn.manager.gpa, .binary, payload)
@@ -1872,7 +1952,7 @@ pub const NetworkManager = struct {
                 conn.manager.gpa.free(payload);
                 return;
             }
-            const n = link.client.sendRawStreamData(link.stream_id, link.send_off, payload, false);
+            const n = link.client.quic.sendRawStreamData(link.stream_id, link.send_off, payload, false);
             if (n > 0) link.send_off += n;
             conn.manager.gpa.free(payload);
             return;
@@ -1883,7 +1963,7 @@ pub const NetworkManager = struct {
                 conn.manager.gpa.free(payload);
                 return;
             }
-            const n = srv.server.sendRawStreamData(srv.quic_conn, srv.stream_id, srv.send_off, payload, false);
+            const n = srv.server.quic.sendRawStreamData(srv.quic_conn, srv.stream_id, srv.send_off, payload, false);
             if (n > 0) srv.send_off += n;
             conn.manager.gpa.free(payload);
             return;
@@ -2209,7 +2289,7 @@ fn remoteAddrString(gpa: std.mem.Allocator, tcp: xev.TCP) ?[]u8 {
 
 /// Format a zquic peer `compat.Address` as `host:port` (IPv4) or
 /// `[host]:port` (IPv6), for the accepted conn's `remote` URI.
-fn quicSrvPeerRemoteString(gpa: std.mem.Allocator, addr: quic_mod.compat.Address) ?[]u8 {
+fn quicSrvPeerRemoteString(gpa: std.mem.Allocator, addr: quic_mod.Address) ?[]u8 {
     var buf: [128]u8 = undefined;
     const txt = switch (addr.any.family) {
         std.posix.AF.INET => blk: {

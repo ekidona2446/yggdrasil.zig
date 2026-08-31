@@ -1,11 +1,11 @@
 //! WolfSSL TLS bindings for Yggdrasil peer links.
 //!
-//! Links statically against wolfSSL (built with --enable-tls13 --enable-sni
+//! Links statically against WolfSSL (built with --enable-tls13 --enable-sni
 //! --enable-quic --enable-opensslextra --enable-ed25519 --enable-curve25519
 //! --enable-certgen --enable-keygen --enable-altcertchains) for TLS 1.3
 //! transport between peers.
 //!
-//! Design: wolfSSL's synchronous `wolfSSL_read`/`wolfSSL_write` API is
+//! Design: WolfSSL's synchronous `wolfSSL_read`/`wolfSSL_write` API is
 //! bridged onto our libxev-driven async TCP sockets via custom "memory BIO"
 //! I/O callbacks (`wolfSSL_CTX_SetIORecv` / `wolfSSL_CTX_SetIOSend`) that
 //! read from / write to plain in-memory ring buffers instead of a socket
@@ -99,7 +99,7 @@ pub extern "c" fn wolfSSL_CTX_UseSNI(ctx: ?*WOLFSSL_CTX, sni_type: u8, data: ?*c
 // Custom memory-backed I/O callbacks
 // ---------------------------------------------------------------------------
 //
-// wolfSSL treats these exactly like a socket read()/write(): return the
+// WolfSSL treats these exactly like a socket read()/write(): return the
 // number of bytes moved, or a negative WOLFSSL_CBIO_ERR_* code. We use them
 // to bridge into caller-managed ring buffers rather than a real fd, so the
 // actual network I/O can stay on libxev's async TCP watcher.
@@ -121,7 +121,7 @@ pub const WOLFSSL_CBIO_ERR_GENERAL: c_int = -1;
 // wolfCrypt: Ed25519 + certificate generation (WOLFSSL_CERT_GEN)
 // ---------------------------------------------------------------------------
 
-const CTC_NAME_SIZE: usize = 64;
+pub const CTC_NAME_SIZE: usize = 64;
 const CTC_SERIAL_SIZE: usize = 20;
 const CTC_DATE_SIZE: usize = 32;
 const ED25519_KEY_SIZE: usize = 32;
@@ -135,7 +135,7 @@ const ED25519_TYPE: c_int = 19; // wolfssl/wolfcrypt/asn_public.h enum CertType
 const CTC_ED25519: c_int = @bitCast(@as(u32, 0x7f8f65d4));
 
 /// Mirrors wolfssl/wolfcrypt/ed25519.h `ed25519_key`. We only need it to be
-/// large enough / correctly aligned for wolfSSL's internal use; we never
+/// large enough / correctly aligned for WolfSSL's internal use; we never
 /// touch its fields directly other than via the wc_ed25519_* API.
 /// wolfSSL_lib_version-gated opaque blob sized generously (the real struct
 /// is well under 512 bytes on all supported platforms as of the versions
@@ -153,13 +153,53 @@ pub const WC_RNG = extern struct {
     _opaque: [256]u8 align(16) = undefined,
 };
 
+// ---------------------------------------------------------------------------
+// wolfCrypt: ECDSA P-256 (HAVE_ECC) + certificate generation
+// ---------------------------------------------------------------------------
+//
+// Used only by `quic_identity.zig`. The QUIC stack (zquic) cannot sign a TLS
+// 1.3 CertificateVerify with Ed25519 — see that file for the full reasoning —
+// so the QUIC listener gets its own ECDSA P-256 key pair, also generated here
+// at runtime by WolfSSL rather than embedded in the source tree.
+//
+// `sizeof(ecc_key)` was measured against the WolfSSL build this project
+// configures (`--enable-ecc` is pulled in by `--enable-ed25519`): 4208 bytes,
+// 8-byte aligned. Over-allocating is safe because WolfSSL only ever writes
+// through `wc_ecc_*` calls, never reads past what it wrote.
+
+/// Mirrors wolfssl/wolfcrypt/ecc.h `ecc_key` (measured: 4208 bytes).
+pub const ecc_key = extern struct {
+    _opaque: [4224]u8 align(8) = undefined,
+};
+
+pub extern "c" fn wc_ecc_init(key: *ecc_key) c_int;
+pub extern "c" fn wc_ecc_free(key: *ecc_key) void;
+/// Generate a new ECDSA key pair on the given NIST curve. `keysize` is in
+/// bytes, so 32 selects secp256r1 / P-256.
+pub extern "c" fn wc_ecc_make_key(rng: *WC_RNG, keysize: c_int, key: *ecc_key) c_int;
+/// Export the private key as an RFC 5915 `ECPrivateKey` DER structure
+/// (SEC1, including the curve OID in the `[0] parameters` field).
+pub extern "c" fn wc_EccKeyToDer(key: *ecc_key, output: [*]u8, out_len: u32) c_int;
+
+/// `enum CertType` (wolfssl/wolfcrypt/asn_public.h). Verified against the
+/// installed headers with an offsetof probe.
+pub const CERT_FILE_TYPE_CERT: c_int = 0; // CERT_TYPE
+pub const CERT_FILE_TYPE_ECC_PRIVATEKEY: c_int = 7; // ECC_PRIVATEKEY_TYPE
+pub const KEY_TYPE_ECC: c_int = 12; // ECC_TYPE
+
+/// `CTC_SHA256wECDSA`. wolfssl/wolfcrypt/oid_sum.h defines this constant twice
+/// under different build configs (524 vs. 0x4c4b8217); this build has
+/// `WOLFSSL_ASN_TEMPLATE` enabled (confirmed in the generated options.h), so it
+/// resolves to the OID-sum form — the same situation as `CTC_ED25519` above.
+pub const CTC_SHA256W_ECDSA: c_int = @bitCast(@as(u32, 0x4c4b8217));
+
 pub extern "c" fn wc_InitRng(rng: *WC_RNG) c_int;
 pub extern "c" fn wc_FreeRng(rng: *WC_RNG) c_int;
 
 /// Mirrors wolfssl/wolfcrypt/asn_public.h `CertName` (only used via
 /// XMEMCPY-style whole-struct copy by our code, so exact per-field layout
 /// doesn't matter as long as the size matches).
-const CertName = extern struct {
+pub const CertName = extern struct {
     country: [CTC_NAME_SIZE]u8 = std.mem.zeroes([CTC_NAME_SIZE]u8),
     country_enc: u8 = 0,
     state: [CTC_NAME_SIZE]u8 = std.mem.zeroes([CTC_NAME_SIZE]u8),
@@ -171,7 +211,7 @@ const CertName = extern struct {
     sur: [CTC_NAME_SIZE]u8 = std.mem.zeroes([CTC_NAME_SIZE]u8),
     sur_enc: u8 = 0,
     // NOTE: WOLFSSL_CERT_NAME_ALL (givenName/initials/dnQualifier/dnName)
-    // is *not* enabled in our wolfSSL build, so `org` immediately follows
+    // is *not* enabled in our WolfSSL build, so `org` immediately follows
     // `sur`/`surEnc` here -- matches wolfssl/wolfcrypt/asn_public.h exactly
     // for the flags this build was configured with.
     org: [CTC_NAME_SIZE]u8 = std.mem.zeroes([CTC_NAME_SIZE]u8),
@@ -187,7 +227,7 @@ const CertName = extern struct {
     postal_code: [CTC_NAME_SIZE]u8 = std.mem.zeroes([CTC_NAME_SIZE]u8),
     postal_code_enc: u8 = 0,
     // WOLFSSL_CERT_EXT (busCat/joiC/joiSt) is likewise not enabled.
-    /// Must be last of the "simple" fields, per wolfSSL's own struct comment.
+    /// Must be last of the "simple" fields, per WolfSSL's own struct comment.
     email: [CTC_NAME_SIZE]u8 = std.mem.zeroes([CTC_NAME_SIZE]u8),
     // WOLFSSL_MULTI_ATTRIB *is* enabled transitively via OPENSSL_EXTRA in
     // our build, so a trailing NameAttrib[CTC_MAX_ATTRIB] array follows
@@ -196,7 +236,7 @@ const CertName = extern struct {
     name: [4]NameAttrib = std.mem.zeroes([4]NameAttrib),
 };
 
-const NameAttrib = extern struct {
+pub const NameAttrib = extern struct {
     sz: c_int = 0,
     id: c_int = 0,
     attr_type: c_int = 0,
@@ -207,7 +247,7 @@ const NameAttrib = extern struct {
 /// (has CertName issuer/subject inline plus assorted fixed buffers); we
 /// over-allocate generously and only touch the handful of leading fields we
 /// need directly, matching the real struct's layout for those fields.
-const Cert = extern struct {
+pub const Cert = extern struct {
     version: c_int = 0,
     serial: [CTC_SERIAL_SIZE]u8 = std.mem.zeroes([CTC_SERIAL_SIZE]u8),
     serial_sz: c_int = 0,
@@ -231,7 +271,7 @@ pub extern "c" fn wc_MakeCert_ex(cert: *Cert, der_buffer: [*]u8, der_sz: u32, ke
 pub extern "c" fn wc_SignCert_ex(request_sz: c_int, s_type: c_int, buf: [*]u8, buf_sz: u32, key_type: c_int, key: *anyopaque, rng: *WC_RNG) c_int;
 pub extern "c" fn wc_DerToPem(der: [*]const u8, der_sz: u32, output: [*]u8, output_sz: u32, cert_type: c_int) c_int;
 
-const CERT_TYPE: c_int = 0;
+pub const CERT_TYPE: c_int = 0;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -352,7 +392,7 @@ const PKCS8_HEADER_ED25519 = [_]u8{
 };
 
 /// Wraps a raw 32-byte Ed25519 seed in a minimal PKCS8 `PrivateKeyInfo` DER
-/// envelope (RFC 8410 sec. 7), which is the format wolfSSL's
+/// envelope (RFC 8410 sec. 7), which is the format WolfSSL's
 /// `wolfSSL_CTX_use_PrivateKey_buffer(..., WOLFSSL_FILETYPE_ASN1)` expects
 /// for Ed25519 keys.
 fn wrapEd25519Pkcs8(gpa: std.mem.Allocator, seed: [32]u8) ![]u8 {
@@ -365,7 +405,7 @@ fn wrapEd25519Pkcs8(gpa: std.mem.Allocator, seed: [32]u8) ![]u8 {
 /// Generate a self-signed, never-expiring X.509 certificate bound to
 /// `ed25519_seed` (the node's Ed25519 identity secret key seed) using
 /// wolfCrypt's certificate generation API directly (WOLFSSL_CERT_GEN +
-/// HAVE_ED25519 + WOLFSSL_KEY_GEN, all enabled in our wolfSSL build).
+/// HAVE_ED25519 + WOLFSSL_KEY_GEN, all enabled in our WolfSSL build).
 ///
 /// The certificate's CommonName is the hex-encoded public key, mirroring
 /// the reference Go implementation so that the identity is recoverable
@@ -398,7 +438,7 @@ pub fn generateIdentityCert(gpa: std.mem.Allocator, ed25519_seed: [32]u8, public
     if (wc_InitCert(&cert) != 0) return TlsError.CertGenFailed;
 
     // RFC5280 4.1.2.5: "99991231235959Z" represents "no well-defined
-    // expiration date" -- but wolfSSL's Cert.daysValid is simpler to use
+    // expiration date" -- but WolfSSL's Cert.daysValid is simpler to use
     // and we don't have direct access to set notAfter arbitrarily here, so
     // use a very long validity window (100 years) instead, which is
     // effectively the same in practice for a mesh identity certificate.
@@ -428,7 +468,7 @@ pub fn generateIdentityCert(gpa: std.mem.Allocator, ed25519_seed: [32]u8, public
     return .{ .cert_der = cert_der, .key_der = key_der };
 }
 
-fn setCommonName(name: *CertName, hex: []const u8) void {
+pub fn setCommonName(name: *CertName, hex: []const u8) void {
     const n = @min(hex.len, CTC_NAME_SIZE - 1);
     @memcpy(name.common_name[0..n], hex[0..n]);
     name.common_name[n] = 0;
@@ -436,7 +476,7 @@ fn setCommonName(name: *CertName, hex: []const u8) void {
 }
 
 // ---------------------------------------------------------------------------
-// TlsConn: bridges wolfSSL's synchronous read()/write()-style API onto
+// TlsConn: bridges WolfSSL's synchronous read()/write()-style API onto
 // caller-managed byte buffers, so the real network I/O can stay on
 // libxev's async TCP watcher (see network.zig).
 // ---------------------------------------------------------------------------
@@ -457,10 +497,10 @@ fn setCommonName(name: *CertName, hex: []const u8) void {
 pub const TlsConn = struct {
     ssl: *WOLFSSL,
     /// Ciphertext bytes received from the raw socket, not yet consumed by
-    /// wolfSSL's recv callback.
+    /// WolfSSL's recv callback.
     incoming: std.ArrayListUnmanaged(u8) = .empty,
     incoming_pos: usize = 0,
-    /// Ciphertext bytes wolfSSL wants sent out; caller drains and writes
+    /// Ciphertext bytes WolfSSL wants sent out; caller drains and writes
     /// these to the raw socket.
     outgoing: std.ArrayListUnmanaged(u8) = .empty,
     gpa: std.mem.Allocator,
@@ -488,7 +528,7 @@ pub const TlsConn = struct {
     }
 
     /// Append raw bytes just read from the socket, to be consumed by
-    /// wolfSSL on the next pump/read call.
+    /// WolfSSL on the next pump/read call.
     pub fn feedCiphertext(self: *TlsConn, data: []const u8) !void {
         // Compact already-consumed bytes before growing, so a long-lived
         // connection doesn't accumulate an ever-growing dead prefix.
@@ -526,9 +566,9 @@ pub const TlsConn = struct {
 
     /// Encrypt `data` as application traffic; resulting ciphertext is
     /// appended to `outgoing` (drain + send it). Returns `.ok` once all of
-    /// `data` has been consumed by wolfSSL (may require multiple calls if
-    /// wolfSSL reports `.want_write` mid-way -- caller should drain+flush
-    /// then retry with the *same* `data` per wolfSSL's own re-entry rules).
+    /// `data` has been consumed by WolfSSL (may require multiple calls if
+    /// WolfSSL reports `.want_write` mid-way -- caller should drain+flush
+    /// then retry with the *same* `data` per WolfSSL's own re-entry rules).
     pub fn writePlaintext(self: *TlsConn, data: []const u8) IoResult {
         const ret = wolfSSL_write(self.ssl, data.ptr, @intCast(data.len));
         return classifyResult(self.ssl, ret);
@@ -546,7 +586,7 @@ pub const TlsConn = struct {
     }
 };
 
-/// wolfSSL recv callback: pull ciphertext out of `TlsConn.incoming`.
+/// WolfSSL recv callback: pull ciphertext out of `TlsConn.incoming`.
 fn ioRecvCallback(ssl: ?*WOLFSSL, buf: [*]u8, sz: c_int, ctx: ?*anyopaque) callconv(.c) c_int {
     _ = ssl;
     const self: *TlsConn = @ptrCast(@alignCast(ctx orelse return WOLFSSL_CBIO_ERR_GENERAL));
@@ -558,8 +598,8 @@ fn ioRecvCallback(ssl: ?*WOLFSSL, buf: [*]u8, sz: c_int, ctx: ?*anyopaque) callc
     return @intCast(n);
 }
 
-/// wolfSSL send callback: append ciphertext to `TlsConn.outgoing` (always
-/// "succeeds" from wolfSSL's point of view -- we buffer unboundedly rather
+/// WolfSSL send callback: append ciphertext to `TlsConn.outgoing` (always
+/// "succeeds" from WolfSSL's point of view -- we buffer unboundedly rather
 /// than applying backpressure here, which is acceptable for the modest
 /// per-peer traffic volumes ironwood mesh links see in practice).
 fn ioSendCallback(ssl: ?*WOLFSSL, buf: [*]const u8, sz: c_int, ctx: ?*anyopaque) callconv(.c) c_int {
@@ -608,7 +648,7 @@ test "generate identity cert from seed" {
     try testing.expect(ident.cert_der.len > 0);
     try testing.expectEqual(@as(usize, PKCS8_HEADER_ED25519.len + 32), ident.key_der.len);
 
-    // Round-trip through a real CTX to make sure wolfSSL itself accepts the
+    // Round-trip through a real CTX to make sure WolfSSL itself accepts the
     // generated cert + key (this is the strongest correctness check we can
     // do without a full handshake).
     const ctx = try newServerCtx();

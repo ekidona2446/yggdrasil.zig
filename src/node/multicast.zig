@@ -38,6 +38,10 @@ const timemod = @import("util").time;
 // ---------------------------------------------------------------------------
 
 const IFF_UP: c_uint = 0x1;
+/// Defined for completeness but deliberately not used as a filter:
+/// yggdrasil-go's `_updateInterfaces` checks only Up/Running/Multicast and
+/// not-PointToPoint, so it multicasts on loopback too. Matching that keeps two
+/// nodes on one host discoverable in both implementations.
 const IFF_LOOPBACK: c_uint = 0x8;
 const IFF_POINTOPOINT: c_uint = 0x10;
 const IFF_RUNNING: c_uint = 0x40;
@@ -63,6 +67,15 @@ const IPV6_JOIN_GROUP: u32 = switch (builtin.os.tag) {
     .freebsd, .netbsd, .openbsd, .dragonfly, .illumos,
     => 12,
     else => 20,
+};
+
+/// `IPV6_LEAVE_GROUP` / `IPV6_DROP_MEMBERSHIP`.
+const IPV6_LEAVE_GROUP: u32 = switch (builtin.os.tag) {
+    .linux => 21,
+    .windows, .macos, .ios, .maccatalyst, .tvos, .visionos, .watchos,
+    .freebsd, .netbsd, .openbsd, .dragonfly, .illumos,
+    => 13,
+    else => 21,
 };
 
 /// `struct sockaddr_in6` in the Linux/BSD/Windows layout (`sin6_family` first).
@@ -188,6 +201,9 @@ pub const Multicast = struct {
 
     /// Discovered/selected interfaces (owned).
     interfaces: std.ArrayListUnmanaged(IfInfo) = .empty,
+    /// Interface indexes whose group membership we currently hold, so we join
+    /// each one once instead of on every tick.
+    joined: std.AutoHashMapUnmanaged(u32, void) = .empty,
     /// The beacon listener's actual bound port (0 = no beacon listener yet).
     beacon_port: u16 = 0,
     /// URI of the beacon listener we created (owned; null until created).
@@ -260,6 +276,9 @@ pub const Multicast = struct {
     pub fn stop(self: *Multicast) void {
         if (!self.running) return;
         self.running = false;
+        // Closing the socket drops every membership; just forget the record so
+        // a later start() joins again.
+        self.joined.clearRetainingCapacity();
         if (self.sock >= 0) {
             _ = c.close(self.sock);
             self.sock = -1;
@@ -424,13 +443,55 @@ pub const Multicast = struct {
                 continue;
             };
 
-            if (mc.listen) self.joinGroup(idx);
+        }
+        self.reconcileMemberships();
+    }
+
+    /// Bring group membership in line with the interfaces we just enumerated.
+    ///
+    /// yggdrasil-go calls `JoinGroup` for every listen interface on every tick
+    /// and discards the resulting `EADDRINUSE`, so it issues one pointless
+    /// setsockopt per interface per second forever and never gives a membership
+    /// back when an interface disappears. Joining only what is new and dropping
+    /// what is gone is the same observable behaviour -- we end up a member of
+    /// ff02::114 on exactly the listen interfaces -- without the churn.
+    fn reconcileMemberships(self: *Multicast) void {
+        var wanted: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer wanted.deinit(self.gpa);
+        for (self.interfaces.items) |i| {
+            if (!i.listen) continue;
+            wanted.put(self.gpa, i.index, {}) catch {};
+            if (self.joined.contains(i.index)) continue;
+            if (self.setMembership(i.index, IPV6_JOIN_GROUP)) {
+                self.joined.put(self.gpa, i.index, {}) catch {};
+            }
+        }
+        var stale = std.ArrayList(u32).empty;
+        defer stale.deinit(self.gpa);
+        var it = self.joined.keyIterator();
+        while (it.next()) |kp| {
+            if (!wanted.contains(kp.*)) stale.append(self.gpa, kp.*) catch {};
+        }
+        for (stale.items) |idx| {
+            _ = self.setMembership(idx, IPV6_LEAVE_GROUP);
+            _ = self.joined.remove(idx);
         }
     }
 
-    fn joinGroup(self: *Multicast, idx: u32) void {
+    /// Returns true when we hold the membership afterwards. `EADDRINUSE` on a
+    /// join means we were already a member, which is the wanted outcome; every
+    /// other failure is reported, unlike the reference which discards them all.
+    fn setMembership(self: *Multicast, idx: u32, opt: u32) bool {
         var mreq = ipv6_mreq{ .multiaddr = MULTICAST_GROUP, .interface = idx };
-        _ = c.setsockopt(self.sock, c.IPPROTO.IPV6, IPV6_JOIN_GROUP, &mreq, @sizeOf(ipv6_mreq));
+        if (c.setsockopt(self.sock, c.IPPROTO.IPV6, opt, &mreq, @sizeOf(ipv6_mreq)) == 0) return true;
+        const err = std.c._errno().*;
+        if (opt == IPV6_JOIN_GROUP and err == @intFromEnum(std.c.E.ADDRINUSE)) return true;
+        std.debug.print("[ygg] multicast: setsockopt({s}) on ifindex {d} failed: {d}\n", .{
+            if (opt == IPV6_JOIN_GROUP) "IPV6_JOIN_GROUP" else "IPV6_LEAVE_GROUP",
+            idx,
+            err,
+        });
+        return false;
     }
 
     /// Ensure a beacon listener exists and send our advertisement on every
