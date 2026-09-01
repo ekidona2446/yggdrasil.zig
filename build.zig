@@ -1,9 +1,11 @@
 const std = @import("std");
 
 const WolfsslMode = enum {
-    /// Build wolfSSL from the Zig package dependency with autotools and link the
-    /// resulting static archive into the executable. This is the default for
-    /// native Unix-like builds.
+    /// Build wolfSSL from the Zig package dependency and link the resulting
+    /// static archive into the executable. On native Unix-like hosts this uses
+    /// autotools (sh/configure/make); on Windows -- native or cross -- it uses
+    /// CMake with Zig's own C compiler (`zig cc`), so no MSVC/MinGW install is
+    /// required. This is the default everywhere.
     bundled,
     /// Use an already-built wolfSSL prefix passed with -Dwolfssl-prefix=PATH.
     system,
@@ -86,7 +88,7 @@ pub fn build(b: *std.Build) void {
     node_mod.addImport("ironwood", ironwood);
     node_mod.addImport("xev", xev_mod);
     node_mod.addImport("async", async_mod);
-	node_mod.addImport("util", util_mod);
+    node_mod.addImport("util", util_mod);
 
     const zquic_dep = b.dependency("zquic", .{
         .target = target,
@@ -115,13 +117,13 @@ pub fn build(b: *std.Build) void {
     linkLibwebsockets(exe.root_module, lws);
 
     b.installArtifact(exe);
- 
+
     if (target.result.os.tag == .windows) {
-		if (wintunDllPath(b, target)) |dll| {
-			const install_dll = b.addInstallBinFile(dll, "wintun.dll");
-			b.getInstallStep().dependOn(&install_dll.step);
-		}
-	}
+        if (wintunDllPath(b, target)) |dll| {
+            const install_dll = b.addInstallBinFile(dll, "wintun.dll");
+            b.getInstallStep().dependOn(&install_dll.step);
+        }
+    }
 
     // ---- peer_probe tool --------------------------------------------------
     const probe = b.addExecutable(.{
@@ -200,7 +202,7 @@ pub fn build(b: *std.Build) void {
     node_tests.root_module.addImport("ironwood", ironwood);
     node_tests.root_module.addImport("xev", xev_mod);
     node_tests.root_module.addImport("async", async_mod);
-	node_tests.root_module.addImport("util", util_mod);
+    node_tests.root_module.addImport("util", util_mod);
     node_tests.root_module.addImport("zquic", zquic_mod);
     linkWolfssl(node_tests.root_module, wolfssl);
     linkLibwebsockets(node_tests.root_module, lws);
@@ -215,6 +217,26 @@ const WolfsslPaths = struct {
     /// ordered after it. Null when a prebuilt -Dwolfssl-prefix is in use.
     build_step: ?*std.Build.Step = null,
 };
+
+fn targetIsWindows(target: std.Build.ResolvedTarget) bool {
+    return target.result.os.tag == .windows;
+}
+
+/// True when the requested target differs from the build host (in a way that
+/// matters for the C dependency builds: OS or CPU architecture).
+fn isCross(b: *std.Build, target: std.Build.ResolvedTarget) bool {
+    const host = b.graph.host.result;
+    return target.result.os.tag != host.os.tag or
+        target.result.cpu.arch != host.cpu.arch;
+}
+
+/// The `-target` triple to pass to `zig cc` when cross-compiling, or null for
+/// native builds. The C dependency scripts generate their own `zig cc` wrapper
+/// (with the executable bit set and a full path) from this.
+fn zigTargetTriple(b: *std.Build, target: std.Build.ResolvedTarget) ?[]const u8 {
+    if (!isCross(b, target)) return null;
+    return target.result.zigTriple(b.graph.arena) catch @panic("OOM");
+}
 
 fn configureWolfssl(
     b: *std.Build,
@@ -234,20 +256,29 @@ fn configureWolfssl(
         .bundled => {},
     }
 
-    if (!target.query.isNative()) {
-        @panic("bundled wolfSSL uses autotools for the native host only; for cross builds pass -Dwolfssl=system -Dwolfssl-prefix=/path/to/target/wolfssl");
+    const wolfssl_dep = b.dependency("wolfssl", .{});
+
+    // Windows (native or cross): CMake + zig cc. Works with just Zig + CMake
+    // installed -- no MSVC, MinGW, autoconf or libtool needed.
+    if (targetIsWindows(target)) {
+        return configureWolfsslCmake(b, target, wolfssl_dep.path("."));
     }
 
+    // Cross-compiling to a non-Windows OS (e.g. macOS from Linux) needs that
+    // OS's SDK; autotools cannot cross here, so require an explicit prefix.
+    if (isCross(b, target)) {
+        @panic("bundled wolfSSL cross-compiles to Windows via CMake/zig cc; for other cross targets pass -Dwolfssl=system -Dwolfssl-prefix=/path/to/target/wolfssl");
+    }
+
+    // Native Unix-like build: autotools, as before.
     switch (target.result.os.tag) {
         .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => {},
         else => @panic("bundled wolfSSL requires a Unix-like build host with sh, make, autoconf and libtool; pass -Dwolfssl-prefix for this target"),
     }
 
-    const wolfssl_dep = b.dependency("wolfssl", .{});
     const run = b.addSystemCommand(&.{
         "sh",
         "-c",
-        \\
         \\set -eu
         \\src="$1"
         \\out="$2"
@@ -288,24 +319,90 @@ fn configureWolfssl(
     };
 }
 
+/// wolfSSL via CMake + `zig cc`. Used for Windows builds (native and cross).
+fn configureWolfsslCmake(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    wolfssl_src: std.Build.LazyPath,
+) WolfsslPaths {
+    const run = b.addSystemCommand(&.{
+        "sh",
+        "-c",
+        \\set -eu
+        \\src="$1"
+        \\out="$2"
+        \\zigexe="$3"
+        \\triple="$4"
+        \\shift 4
+        \\rm -rf "$out"
+        \\mkdir -p "$out"
+        \\if [ -n "$triple" ]; then
+        \\  printf '#!/bin/sh\nexec "%s" cc -target "%s" "$@"\n' "$zigexe" "$triple" > "$out/zig-cc.sh"
+        \\else
+        \\  printf '#!/bin/sh\nexec "%s" cc "$@"\n' "$zigexe" > "$out/zig-cc.sh"
+        \\fi
+        \\chmod +x "$out/zig-cc.sh"
+        \\cmake -S "$src" -B "$out/build" \
+        \\  "-DCMAKE_C_COMPILER=$out/zig-cc.sh" \
+        \\  "$@" \
+        \\  "-DCMAKE_INSTALL_PREFIX=$out/install" \
+        \\  -DCMAKE_BUILD_TYPE=Release \
+        \\  -DCMAKE_C_FLAGS=-Wno-error=date-time \
+        \\  -DBUILD_SHARED_LIBS=OFF \
+        \\  -DWOLFSSL_TLS13=yes \
+        \\  -DWOLFSSL_QUIC=yes \
+        \\  -DWOLFSSL_OPENSSLEXTRA=yes \
+        \\  -DWOLFSSL_SNI=yes \
+        \\  -DWOLFSSL_OPENSSLALL=yes \
+        \\  -DWOLFSSL_ED25519=yes \
+        \\  -DWOLFSSL_CURVE25519=yes \
+        \\  -DWOLFSSL_CERTGEN=yes \
+        \\  -DWOLFSSL_KEYGEN=yes
+        \\cmake --build "$out/build" -j"${NPROC:-2}"
+        \\cmake --install "$out/build"
+        \\test -f "$out/install/lib/libwolfssl.a"
+        ,
+        "build-wolfssl-cmake",
+    });
+    run.addDirectoryArg(wolfssl_src);
+    const out_dir = run.addOutputDirectoryArg("wolfssl");
+    run.addArg(b.graph.zig_exe);
+    run.addArg(zigTargetTriple(b, target) orelse "");
+    if (isCross(b, target)) {
+        run.addArg("-DCMAKE_SYSTEM_NAME=Windows");
+        run.addArg("-DCMAKE_SYSTEM_PROCESSOR=x86_64");
+    }
+
+    return .{
+        .include_dir = out_dir.path(b, "install/include"),
+        .static_lib = out_dir.path(b, "install/lib/libwolfssl.a"),
+        .build_step = &run.step,
+    };
+}
+
 fn linkWolfssl(module: *std.Build.Module, wolfssl: WolfsslPaths) void {
     module.addIncludePath(wolfssl.include_dir);
     // Add the archive by path instead of `-lwolfssl`, so the result is linked
     // statically even on systems that also have a shared libwolfssl installed.
     module.addObjectFile(wolfssl.static_lib);
+    module.link_libc = true;
     const target = module.resolved_target orelse @panic("linkWolfssl requires a module with a resolved target");
-	if (target.result.os.tag == .windows) {
-		module.link_libc = true;
-		// wolfSSL's default build enables loading system CA certs, which on
-		// Windows goes through the Crypt32 certificate-store APIs
-		// (CertOpenSystemStoreA/CertEnumCertificatesInStore/CertCloseStore).
-		module.linkSystemLibrary("crypt32", .{});
-		module.linkSystemLibrary("ws2_32", .{});
-		module.linkSystemLibrary("iphlpapi", .{});
-	} else {
-		module.linkSystemLibrary("m", .{});
-		module.linkSystemLibrary("pthread", .{});
-	}
+    switch (target.result.os.tag) {
+        .windows => {
+            // wolfSSL's default build enables loading system CA certs, which on
+            // Windows goes through the Crypt32 certificate-store APIs
+            // (CertOpenSystemStoreA/CertEnumCertificatesInStore/CertCloseStore).
+            module.linkSystemLibrary("crypt32", .{});
+            module.linkSystemLibrary("ws2_32", .{});
+            module.linkSystemLibrary("iphlpapi", .{});
+        },
+        .linux => {
+            module.linkSystemLibrary("m", .{});
+            module.linkSystemLibrary("pthread", .{});
+        },
+        // macOS, *BSD, etc.: libSystem/libc already provide libm and pthread.
+        else => {},
+    }
 }
 
 const LwsPaths = struct {
@@ -320,14 +417,19 @@ const LwsPaths = struct {
 /// with no compiler error in the log. Serializing them costs a little wall time
 /// on big machines and makes the build actually finish on small ones.
 fn configureLibwebsockets(b: *std.Build, target: std.Build.ResolvedTarget, after: ?*std.Build.Step) LwsPaths {
-    if (!target.query.isNative()) {
-        @panic("bundled libwebsockets uses cmake for the native host only");
-    }
     const lws_dep = b.dependency("libwebsockets", .{});
+
+    if (targetIsWindows(target)) {
+        return configureLibwebsocketsCmake(b, target, lws_dep.path("."), after);
+    }
+
+    if (isCross(b, target)) {
+        @panic("bundled libwebsockets cross-compiles to Windows via CMake/zig cc; for other cross targets build libwebsockets yourself and link it with -Dlws-prefix");
+    }
+
     const run = b.addSystemCommand(&.{
         "sh",
         "-c",
-        \\
         \\set -eu
         \\src="$1"
         \\out="$2"
@@ -367,10 +469,96 @@ fn configureLibwebsockets(b: *std.Build, target: std.Build.ResolvedTarget, after
     };
 }
 
+/// libwebsockets for Windows (native or cross): CMake + `zig cc`. lws's win32
+/// port assumes a case-insensitive filesystem (`<Psapi.h>`) and gcc-style
+/// warnings, so we provide a casing shim and downgrade the stricter clang
+/// diagnostics that zig cc enables.
+fn configureLibwebsocketsCmake(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    lws_src: std.Build.LazyPath,
+    after: ?*std.Build.Step,
+) LwsPaths {
+    const run = b.addSystemCommand(&.{
+        "sh",
+        "-c",
+        \\set -eu
+        \\src="$1"
+        \\out="$2"
+        \\zigexe="$3"
+        \\triple="$4"
+        \\shift 4
+        \\rm -rf "$out"
+        \\mkdir -p "$out"
+        \\if [ -n "$triple" ]; then
+        \\  printf '#!/bin/sh\nexec "%s" cc -target "%s" "$@"\n' "$zigexe" "$triple" > "$out/zig-cc.sh"
+        \\else
+        \\  printf '#!/bin/sh\nexec "%s" cc "$@"\n' "$zigexe" > "$out/zig-cc.sh"
+        \\fi
+        \\chmod +x "$out/zig-cc.sh"
+        \\# lws includes <Psapi.h> but mingw ships psapi.h (lowercase); a shim
+        \\# include dir fixes the case on case-sensitive filesystems.
+        \\mkdir -p "$out/shim"
+        \\printf '#ifndef PSAPI_H_ALIAS\n#define PSAPI_H_ALIAS\n#include <psapi.h>\n#endif\n' > "$out/shim/Psapi.h"
+        \\cmake -S "$src" -B "$out/build" \
+        \\  "-DCMAKE_C_COMPILER=$out/zig-cc.sh" \
+        \\  "$@" \
+        \\  "-DCMAKE_INSTALL_PREFIX=$out/install" \
+        \\  -DCMAKE_BUILD_TYPE=Release \
+        \\  "-DCMAKE_C_FLAGS=-I$out/shim -include pthread.h -Wno-error -Wno-unused-label -Wno-error=date-time -Wno-macro-redefined -Wno-error=int-conversion -Wno-error=incompatible-pointer-types" \
+        \\  -DDISABLE_WERROR=ON \
+        \\  -DLWS_HAVE_PTHREAD_H=1 \
+        \\  -DLWS_WITH_SSL=OFF \
+        \\  -DLWS_WITH_SCHANNEL=OFF \
+        \\  -DLWS_WITH_SHARED=OFF \
+        \\  -DLWS_WITH_STATIC=ON \
+        \\  -DLWS_WITHOUT_TESTAPPS=ON \
+        \\  -DLWS_WITHOUT_TEST_SERVER=ON \
+        \\  -DLWS_WITHOUT_TEST_CLIENT=ON \
+        \\  -DLWS_WITHOUT_TEST_PING=ON \
+        \\  -DLWS_WITH_MINIMAL_EXAMPLES=OFF \
+        \\  -DLWS_WITH_HTTP2=OFF \
+        \\  -DLWS_IPV6=ON
+        \\cmake --build "$out/build" -j"${NPROC:-2}"
+        \\cmake --install "$out/build"
+        \\# lws names its static archive libwebsockets_static.a on Windows.
+        \\if [ -f "$out/install/lib/libwebsockets_static.a" ] && [ ! -f "$out/install/lib/libwebsockets.a" ]; then
+        \\  cp "$out/install/lib/libwebsockets_static.a" "$out/install/lib/libwebsockets.a"
+        \\fi
+        \\test -f "$out/install/lib/libwebsockets.a"
+        ,
+        "build-libwebsockets-cmake",
+    });
+    if (after) |step| run.step.dependOn(step);
+    run.addDirectoryArg(lws_src);
+    const out_dir = run.addOutputDirectoryArg("libwebsockets");
+    run.addArg(b.graph.zig_exe);
+    run.addArg(zigTargetTriple(b, target) orelse "");
+    if (isCross(b, target)) {
+        run.addArg("-DCMAKE_SYSTEM_NAME=Windows");
+        run.addArg("-DCMAKE_SYSTEM_PROCESSOR=x86_64");
+    }
+
+    return .{
+        .include_dir = out_dir.path(b, "install/include"),
+        .static_lib = out_dir.path(b, "install/lib/libwebsockets.a"),
+    };
+}
+
 fn linkLibwebsockets(module: *std.Build.Module, lws: LwsPaths) void {
     module.addIncludePath(lws.include_dir);
     module.addObjectFile(lws.static_lib);
     module.link_libc = true;
+    const target = module.resolved_target orelse @panic("linkLibwebsockets requires a module with a resolved target");
+    switch (target.result.os.tag) {
+        .windows => {
+            // lws uses winsock, and we force pthreads on Windows (its win32
+            // port otherwise has no mutex implementation).
+            module.linkSystemLibrary("ws2_32", .{});
+            module.linkSystemLibrary("pthread", .{});
+        },
+        else => {},
+    }
 }
 
 /// Locate the architecture-appropriate `wintun.dll` inside the `wintun`
@@ -381,16 +569,16 @@ fn linkLibwebsockets(module: *std.Build.Module, lws: LwsPaths) void {
 /// the resulting binary just won't find a TUN device at runtime without a
 /// `wintun.dll` placed next to it by other means.
 fn wintunDllPath(b: *std.Build, target: std.Build.ResolvedTarget) ?std.Build.LazyPath {
-	const wintun_dep = b.lazyDependency("wintun", .{}) orelse return null;
-	const arch_dir = switch (target.result.cpu.arch) {
-		.x86_64 => "amd64",
-		.x86 => "x86",
-		.aarch64 => "arm64",
-		.arm => "arm",
-		else => {
-			std.log.warn("no prebuilt wintun.dll for target arch {s}; TUN will be unavailable at runtime", .{@tagName(target.result.cpu.arch)});
-			return null;
-		},
-	};
-	return wintun_dep.path(b.pathJoin(&.{ "bin", arch_dir, "wintun.dll" }));
+    const wintun_dep = b.lazyDependency("wintun", .{}) orelse return null;
+    const arch_dir = switch (target.result.cpu.arch) {
+        .x86_64 => "amd64",
+        .x86 => "x86",
+        .aarch64 => "arm64",
+        .arm => "arm",
+        else => {
+            std.log.warn("no prebuilt wintun.dll for target arch {s}; TUN will be unavailable at runtime", .{@tagName(target.result.cpu.arch)});
+            return null;
+        },
+    };
+    return wintun_dep.path(b.pathJoin(&.{ "bin", arch_dir, "wintun.dll" }));
 }
