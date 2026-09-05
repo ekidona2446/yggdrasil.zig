@@ -12,8 +12,6 @@
 //! bytes, with no sockets and no allocator. The event-loop state machine that
 //! drives them lives in `network.zig` (it owns the libxev completions); keeping
 //! this layer pure is what makes the handshake testable without a network.
-//!
-//! Reference: `yggdrasil-go/src/core/link_socks.go`.
 
 const std = @import("std");
 const net = std.Io.net;
