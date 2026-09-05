@@ -10,7 +10,7 @@
         },
         .wolfssl = .{
             .url = "https://github.com/wolfSSL/wolfssl/archive/refs/heads/master.tar.gz",
-            .hash = "N-V-__8AAPnj6gmo5i7phj9O9U7NQd4Jm9djcqpnEdGK7nAr",
+            .hash = "N-V-__8AAOiC7AlKwKUfp_JsoIFvEhbIvBEdWuKol9o9zhQB",
         },
         .wintun = .{
             .url = "https://www.wintun.net/builds/wintun-0.14.1.zip",
@@ -30,5 +30,7 @@
         "build.zig",
         "build.zig.zon",
         "src",
+        "scripts",
+        "patches",
     },
 }

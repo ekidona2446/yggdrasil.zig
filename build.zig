@@ -396,6 +396,12 @@ const CMAKE_SCRIPT_PREFIX =
     \\endif()
     \\if(NOT "${YGG_SHIM_DIR}" STREQUAL "")
     \\  file(TO_CMAKE_PATH "${YGG_SHIM_DIR}" SHIM_DIR_NATIVE)
+    \\  # Resolve to absolute: execute_process below sets WORKING_DIRECTORY to
+    \\  # OUT_DIR/build, and a relative -I would be resolved there rather than
+    \\  # against the source tree (which is where our generated casing shims live).
+    \\  if(NOT IS_ABSOLUTE "${SHIM_DIR_NATIVE}")
+    \\    get_filename_component(SHIM_DIR_NATIVE "${SHIM_DIR_NATIVE}" ABSOLUTE)
+    \\  endif()
     \\  set(CFLAGS "${CFLAGS} -I${SHIM_DIR_NATIVE}")
     \\endif()
     \\

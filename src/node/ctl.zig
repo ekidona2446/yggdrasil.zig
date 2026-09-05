@@ -28,6 +28,7 @@
 
 const std = @import("std");
 const node = @import("node");
+const dns = node.dns;
 
 const Io = std.Io;
 const net = Io.net;
@@ -155,8 +156,26 @@ fn connect(gpa: std.mem.Allocator, io: Io, endpoint: []const u8) !net.Stream {
     }
 
     const hp = try splitHostPort(rest);
-    const addr = try net.IpAddress.resolve(io, hp.host, hp.port);
-    return net.IpAddress.connect(&addr, io, .{ .mode = .stream, .protocol = .tcp });
+    // Use the blocking getaddrinfo-based resolver (same path the server
+    // side uses for outbound peers) so that hostnames like "localhost"
+    // work from a one-shot control client that has no event loop. Try
+    // each address the resolver returns until one connects.
+    const addrs = dns.resolve(gpa, hp.host, hp.port) catch |err| {
+        emitErr("ctl: resolve {s}: {}\n", .{ hp.host, err });
+        return err;
+    };
+    defer gpa.free(addrs);
+    if (addrs.len == 0) return error.NoAddresses;
+
+    var last_err: anyerror = error.ConnectionRefused;
+    for (addrs) |addr| {
+        if (net.IpAddress.connect(&addr, io, .{ .mode = .stream, .protocol = .tcp })) |stream| {
+            return stream;
+        } else |err| {
+            last_err = err;
+        }
+    }
+    return last_err;
 }
 
 /// Split `host:port`, honouring a bracketed IPv6 literal (`[::1]:9001`) and

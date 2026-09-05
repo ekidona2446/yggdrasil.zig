@@ -218,10 +218,12 @@ pub const NativeTun = struct {
         const api = try Api.load();
 
         var name_buf: [16:0]u8 = .{0} ** 16;
-        const trunc_len = @min(name.len, 15);
-        const display_name = if (std.mem.eql(u8, name, "auto")) "yggdrasil" else name;
-        @memcpy(name_buf[0..@min(display_name.len, 15)], display_name[0..@min(display_name.len, 15)]);
-        _ = trunc_len;
+        // Use capitalised "Yggdrasil" by default to match the reference
+        // Go/Rust implementations' adapter name.
+        const display_name = if (std.mem.eql(u8, name, "auto")) "Yggdrasil" else name;
+        const copy_len = @min(display_name.len, 15);
+        @memcpy(name_buf[0..copy_len], display_name[0..copy_len]);
+        name_buf[copy_len] = 0;
 
         var wname_buf: [64]WCHAR = undefined;
         const wname_len = try std.unicode.utf8ToUtf16Le(&wname_buf, display_name);

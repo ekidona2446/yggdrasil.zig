@@ -53,6 +53,7 @@ const NetworkManager = node.network.NetworkManager;
 const TunAdapter = node.tun.TunAdapter;
 const ReadWriteCloser = node.ipv6rwc.ReadWriteCloser;
 const Config = node.config.Config;
+const ctl = @import("ctl");
 const is_windows = builtin.os.tag == .windows;
 
 const MAINTENANCE_INTERVAL_MS: u64 = 1000;
@@ -73,6 +74,22 @@ pub fn main(init: std.process.Init) !void {
         },
         .version => {
             std.debug.print("yggdrasil.zig {s}\n", .{YGGDRASIL_ZIG_VERSION});
+            return;
+        },
+        .ctl => {
+            // Control client mode: a second invocation talks to a running
+            // node over its admin socket. Do NOT load config or start a
+            // node -- just connect, send the command, print the reply.
+            if (cli.ctl_command == null) {
+                std.debug.print("ctl: no command given (try 'yggdrasil getSelf')\n", .{});
+                return error.InvalidArgument;
+            }
+            const endpoint = cli.ctl_endpoint orelse ctl.default_endpoint;
+            ctl.run(gpa, io, endpoint, cli.ctl_command.?, cli.ctl_args.items, cli.json_output) catch |err| {
+                // The ctl module already printed a diagnostic; exit non-zero.
+                std.process.exit(1);
+                return err;
+            };
             return;
         },
         .run => {},
@@ -638,7 +655,7 @@ const TunIoWindows = struct {
 // CLI parsing
 // ---------------------------------------------------------------------------
 
-const Action = enum { run, help, version };
+const Action = enum { run, help, version, ctl };
 
 const Cli = struct {
     action: Action = .run,
@@ -660,6 +677,11 @@ const Cli = struct {
     print_publickey: bool = false,
     exportkey: bool = false,
 
+    // Control client (ctl) mode.
+    ctl_command: ?[]const u8 = null,
+    ctl_endpoint: ?[]const u8 = null,
+    ctl_args: std.ArrayListUnmanaged([]const u8) = .empty,
+
     // Runtime overrides.
     peers: std.ArrayListUnmanaged([]const u8) = .empty,
     listeners: std.ArrayListUnmanaged([]const u8) = .empty,
@@ -673,6 +695,7 @@ const Cli = struct {
     fn deinit(self: *Cli, gpa: std.mem.Allocator) void {
         self.peers.deinit(gpa);
         self.listeners.deinit(gpa);
+        self.ctl_args.deinit(gpa);
     }
 };
 
@@ -698,6 +721,13 @@ fn printUsage() void {
         \\  -k, --publickey          Print the hex public key and exit
         \\      --exportkey          Print the private key as hex and exit
         \\  -h, --help               Print this help and exit
+        \\
+        \\Control client (talks to a running node over its admin socket):
+        \\  -e, --endpoint URI       Admin endpoint (default tcp://localhost:9001)
+        \\      --json               Pretty-print JSON replies
+        \\  <command> [key=value ...]
+        \\                           Examples: getSelf, getPeers, addPeer uri=tcp://...,
+        \\                           getSessions, getTun, removePeer port=...
         \\
         \\Runtime overrides (repeatable where noted):
         \\      --peer URI           Add an outbound peer (repeatable)
@@ -780,6 +810,18 @@ fn parseArgs(gpa: std.mem.Allocator, raw_args: std.process.Args) !Cli {
             if (args.next()) |v| cli.loglevel = v;
         } else if (std.mem.eql(u8, arg, "--logto")) {
             if (args.next()) |v| cli.logto = v;
+        } else if (eqAny(arg, &.{ "-e", "--endpoint" })) {
+            cli.ctl_endpoint = args.next();
+        } else if (arg.len > 0 and arg[0] != '-') {
+            // Positional argument: first one is the ctl command, subsequent
+            // ones are its key=value arguments. Any known flag is handled
+            // above (including values that happen to not start with '-').
+            if (cli.ctl_command == null) {
+                cli.ctl_command = arg;
+                cli.action = .ctl;
+            } else {
+                cli.ctl_args.append(gpa, arg) catch {};
+            }
         }
     }
     return cli;
