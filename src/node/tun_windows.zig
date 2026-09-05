@@ -218,8 +218,7 @@ pub const NativeTun = struct {
         const api = try Api.load();
 
         var name_buf: [16:0]u8 = .{0} ** 16;
-        // Use capitalised "Yggdrasil" by default to match the reference
-        // Go/Rust implementations' adapter name.
+        // Use capitalised "Yggdrasil" by default to match the reference implementation adapter name.
         const display_name = if (std.mem.eql(u8, name, "auto")) "Yggdrasil" else name;
         const copy_len = @min(display_name.len, 15);
         @memcpy(name_buf[0..copy_len], display_name[0..copy_len]);
