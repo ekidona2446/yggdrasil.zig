@@ -1,6 +1,6 @@
 //! Yggdrasil IPv6 addressing from ed25519 public keys.
 //!
-//! Wire-compatible with the reference implementation.  An ed25519 key is
+//! Wire-compatible with the reference implementation. An ed25519 key is
 //! bitwise-inverted, then the leading 1-bits are counted (clamped to 255)
 //! and the remaining bits after the first 0-bit are packed into the address.
 

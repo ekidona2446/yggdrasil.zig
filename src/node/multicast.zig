@@ -14,6 +14,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const xev = @import("xev");
+const udp_io = @import("udp_io.zig");
 const ironwood = @import("ironwood");
 const node = @import("node.zig");
 
@@ -91,17 +92,186 @@ const SockaddrIn6 = extern struct {
 
 const AF_INET6: u16 = 10;
 
-const IfAddrs = extern struct {
-    ifa_next: ?*IfAddrs,
-    ifa_name: [*:0]u8,
-    ifa_flags: c_uint,
-    ifa_addr: ?*c.sockaddr,
-    ifa_netmask: ?*c.sockaddr,
-    ifa_ifu: ?*c.sockaddr,
-    ifa_data: ?*anyopaque,
+/// One candidate interface, as enumerated by the platform backends below.
+/// `name` is borrowed from the platform's own buffer on POSIX and owned by the
+/// caller on Windows (see `win_if.adapterName`), which is why results are
+/// released through `freeEnumerated` rather than freed directly.
+const RawIf = struct {
+    name: []const u8,
+    index: u32,
+    addr: [16]u8,
+    up: bool,
+    running: bool,
+    multicast: bool,
+    pointopoint: bool,
 };
-extern "c" fn getifaddrs(ifap: *?*IfAddrs) c_int;
-extern "c" fn freeifaddrs(ifa: *IfAddrs) void;
+
+const posix_if = struct {
+    const IfAddrs = extern struct {
+        ifa_next: ?*IfAddrs,
+        ifa_name: [*:0]u8,
+        ifa_flags: c_uint,
+        ifa_addr: ?*c.sockaddr,
+        ifa_netmask: ?*c.sockaddr,
+        ifa_ifu: ?*c.sockaddr,
+        ifa_data: ?*anyopaque,
+    };
+    extern "c" fn getifaddrs(ifap: *?*IfAddrs) c_int;
+    extern "c" fn freeifaddrs(ifa: *IfAddrs) void;
+
+    fn enumerate(gpa: std.mem.Allocator) ![]RawIf {
+        var out: std.ArrayListUnmanaged(RawIf) = .empty;
+        errdefer out.deinit(gpa);
+
+        var head: ?*IfAddrs = null;
+        if (getifaddrs(&head) != 0) return error.EnumerationFailed;
+        defer if (head) |h| freeifaddrs(h);
+
+        var cur = head;
+        while (cur) |ifa| : (cur = ifa.ifa_next) {
+            const sa = ifa.ifa_addr orelse continue;
+            if (sa.family != AF_INET6) continue;
+            const sin6: *align(1) const SockaddrIn6 = @ptrCast(sa);
+            if (!isLinkLocal(&sin6.addr)) continue;
+
+            const name = std.mem.span(ifa.ifa_name);
+            const raw_idx = c.if_nametoindex(ifa.ifa_name);
+            if (raw_idx <= 0) continue;
+
+            try out.append(gpa, .{
+                .name = name,
+                .index = @intCast(raw_idx),
+                .addr = sin6.addr,
+                .up = ifa.ifa_flags & IFF_UP != 0,
+                .running = ifa.ifa_flags & IFF_RUNNING != 0,
+                .multicast = ifa.ifa_flags & IFF_MULTICAST != 0,
+                .pointopoint = ifa.ifa_flags & IFF_POINTOPOINT != 0,
+            });
+        }
+        return out.toOwnedSlice(gpa);
+    }
+};
+
+/// Windows has no `getifaddrs`; the equivalent is `GetAdaptersAddresses`
+/// (iphlpapi), which Zig 0.16's std does not bind, so the pieces this needs
+/// are declared here. Only the fields up to `ipv6_if_index` are spelled out --
+/// iteration follows each entry's `next` pointer, so the trailing half of the
+/// struct (prefixes, gateways, WINS, ...) is never read and can stay undefined.
+const win_if = struct {
+    const ADAPTER_UNICAST = extern struct {
+        alignment: u64,
+        next: ?*ADAPTER_UNICAST,
+        sockaddr: ?*anyopaque,
+        sockaddr_len: i32,
+    };
+
+    const ADAPTER_ADDRESSES = extern struct {
+        alignment: u64,
+        next: ?*ADAPTER_ADDRESSES,
+        adapter_name: [*:0]u8,
+        first_unicast: ?*ADAPTER_UNICAST,
+        first_anycast: ?*anyopaque,
+        first_multicast: ?*anyopaque,
+        first_dns_server: ?*anyopaque,
+        dns_suffix: [*:0]u16,
+        description: [*:0]u16,
+        friendly_name: [*:0]u16,
+        physical_address: [16]u8,
+        physical_address_length: u32,
+        flags: u32,
+        mtu: u32,
+        if_type: u32,
+        oper_status: u32,
+        ipv6_if_index: u32,
+        zone_indices: [16]u32,
+    };
+
+    extern "iphlpapi" fn GetAdaptersAddresses(
+        family: u32,
+        flags: u32,
+        reserved: ?*anyopaque,
+        addresses: ?*anyopaque,
+        size: *u32,
+    ) callconv(.winapi) u32;
+
+    const AF_INET6_WIN: u32 = 23;
+    const GAA_SKIP: u32 = 0x2 | 0x4 | 0x8; // anycast | multicast | dns server
+    const ERROR_BUFFER_OVERFLOW: u32 = 111;
+    const IF_OPER_STATUS_UP: u32 = 1;
+    const IF_TYPE_PPP: u32 = 23;
+    /// Windows exposes no `IFF_MULTICAST`; PPP, loopback and tunnel adapters
+    /// are the ones that cannot carry a link-local multicast group.
+    const NO_MULTICAST_TYPES = [_]u32{ 23, 24, 131 }; // PPP, software loopback, tunnel
+
+    fn enumerate(gpa: std.mem.Allocator) ![]RawIf {
+        var out: std.ArrayListUnmanaged(RawIf) = .empty;
+        errdefer out.deinit(gpa);
+
+        var size: u32 = 16 * 1024;
+        var buf: []u8 = try gpa.alloc(u8, size);
+        errdefer gpa.free(buf);
+        var rc: u32 = 0;
+        while (true) {
+            rc = GetAdaptersAddresses(AF_INET6_WIN, GAA_SKIP, null, buf.ptr, &size);
+            if (rc != ERROR_BUFFER_OVERFLOW) break;
+            buf = gpa.realloc(buf, size) catch return error.EnumerationFailed;
+        }
+        if (rc != 0) return error.EnumerationFailed;
+        defer gpa.free(buf);
+
+        var adapter: ?*ADAPTER_ADDRESSES = @ptrCast(@alignCast(buf.ptr));
+        while (adapter) |a| : (adapter = a.next) {
+            const up = a.oper_status == IF_OPER_STATUS_UP;
+            const type_is_multicast = blk: {
+                for (NO_MULTICAST_TYPES) |t| if (a.if_type == t) break :blk false;
+                break :blk true;
+            };
+
+            var uc = a.first_unicast;
+            while (uc) |u| : (uc = u.next) {
+                const sa: *align(1) const SockaddrIn6 = @ptrCast(u.sockaddr orelse continue);
+                if (sa.family != AF_INET6) continue;
+                if (!isLinkLocal(&sa.addr)) continue;
+
+                try out.append(gpa, .{
+                    .name = adapterName(gpa, a),
+                    .index = a.ipv6_if_index,
+                    .addr = sa.addr,
+                    .up = up,
+                    .running = up,
+                    .multicast = type_is_multicast,
+                    .pointopoint = a.if_type == IF_TYPE_PPP,
+                });
+                break; // one link-local address per adapter is enough
+            }
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
+    /// Prefer the friendly name ("Ethernet 2") -- that is what a Windows user
+    /// would write in `MulticastInterfaces` -- falling back to the adapter
+    /// GUID when the system has no friendly name for it.
+    fn adapterName(gpa: std.mem.Allocator, a: *const ADAPTER_ADDRESSES) []const u8 {
+        const friendly = std.mem.span(a.friendly_name);
+        if (friendly.len > 0) {
+            return std.unicode.utf16LeToUtf8Alloc(gpa, friendly) catch
+                std.mem.span(a.adapter_name);
+        }
+        return std.mem.span(a.adapter_name);
+    }
+};
+
+fn enumerateInterfaces(gpa: std.mem.Allocator) ![]RawIf {
+    if (comptime builtin.os.tag == .windows) return win_if.enumerate(gpa);
+    return posix_if.enumerate(gpa);
+}
+
+fn freeEnumerated(gpa: std.mem.Allocator, raw: []RawIf) void {
+    // Windows names are UTF-8 conversions we own; POSIX ones are borrowed
+    // from `getifaddrs`' own buffer.
+    for (raw) |r| if (comptime builtin.os.tag == .windows) gpa.free(r.name);
+    gpa.free(raw);
+}
 
 /// A received advertisement.
 pub const Advertisement = struct {
@@ -193,7 +363,11 @@ pub const Multicast = struct {
     /// Config entries (slices borrow the config object; never freed here).
     config: []const node.config.MulticastInterfaceConfig,
 
-    sock: c_int = -1,
+    /// `posix.socket_t`: an `i32` fd on POSIX, a `HANDLE` on Windows. A
+    /// separate `sock_open` flag records validity, because a Windows handle
+    /// has no "invalid" integer value to compare against.
+    sock: std.posix.socket_t = undefined,
+    sock_open: bool = false,
     running: bool = false,
     timer: xev.Timer,
     timer_c: xev.Completion = undefined,
@@ -239,12 +413,32 @@ pub const Multicast = struct {
         self.timer.deinit();
     }
 
+    /// `SOCK_CLOEXEC` is a Linux/BSD extension: winsock's `SOCK` has no such
+    /// bit, so it is taken only where the platform libc defines it.
+    const SOCK_CLOEXEC: c_int = if (@hasDecl(c.SOCK, "CLOEXEC")) c.SOCK.CLOEXEC else 0;
+
+    /// `MSG_DONTWAIT` does not exist in winsock, so on Windows the socket
+    /// itself is switched to non-blocking mode (see `start`) and `recvfrom`
+    /// is called with no flags -- which is why the drain loop cannot block.
+    const MSG_DONTWAIT: c_int = if (builtin.os.tag == .windows) 0 else std.posix.MSG.DONTWAIT;
+
+    /// `IPPROTO_IPV6` is 41 on every platform, but std's winsock `IPPROTO`
+    /// struct does not spell it out.
+    const IPPROTO_IPV6: c_int = if (builtin.os.tag == .windows) 41 else c.IPPROTO.IPV6;
+
     /// Open the socket, join the multicast groups, and start the driver timer.
     pub fn start(self: *Multicast) !void {
         if (self.running) return;
-        const fd = c.socket(c.AF.INET6, c.SOCK.DGRAM | c.SOCK.CLOEXEC, 0);
-        if (fd < 0) return error.SocketFailed;
+        const rc = c.socket(AF_INET6, c.SOCK.DGRAM | SOCK_CLOEXEC, 0);
+        if (rc < 0) return error.SocketFailed;
+        const fd = udp_io.socketFromRc(rc);
         self.sock = fd;
+        self.sock_open = true;
+        if (comptime builtin.os.tag == .windows) {
+            // No MSG_DONTWAIT there, so non-blocking has to be a property of
+            // the socket instead of a per-call flag (see MSG_DONTWAIT above).
+            udp_io.setNonblocking(fd) catch {};
+        }
 
         // SO_REUSEADDR (+ SO_REUSEPORT where available) so several nodes can
         // share the well-known group address on the same host.
@@ -262,8 +456,8 @@ pub const Multicast = struct {
             .scope_id = 0,
         };
         if (c.bind(fd, @ptrCast(&bind_addr), @sizeOf(SockaddrIn6)) != 0) {
-            _ = c.close(fd);
-            self.sock = -1;
+            udp_io.closeSocketFd(fd);
+            self.sock_open = false;
             return error.BindFailed;
         }
 
@@ -279,9 +473,9 @@ pub const Multicast = struct {
         // Closing the socket drops every membership; just forget the record so
         // a later start() joins again.
         self.joined.clearRetainingCapacity();
-        if (self.sock >= 0) {
-            _ = c.close(self.sock);
-            self.sock = -1;
+        if (self.sock_open) {
+            udp_io.closeSocketFd(self.sock);
+            self.sock_open = false;
         }
     }
 
@@ -305,7 +499,7 @@ pub const Multicast = struct {
                 self.sock,
                 buf[0..].ptr,
                 buf.len,
-                std.posix.MSG.DONTWAIT,
+                MSG_DONTWAIT,
                 @ptrCast(&from),
                 &from_len,
             );
@@ -382,24 +576,17 @@ pub const Multicast = struct {
         for (self.interfaces.items) |*i| i.deinit(self.gpa);
         self.interfaces.clearRetainingCapacity();
 
-        var head: ?*IfAddrs = null;
-        if (getifaddrs(&head) != 0) return;
-        defer if (head) |h| freeifaddrs(h);
+        const raw = enumerateInterfaces(self.gpa) catch return;
+        defer freeEnumerated(self.gpa, raw);
 
-        var cur = head;
-        while (cur) |ifa| : (cur = ifa.ifa_next) {
-            const name = std.mem.span(ifa.ifa_name);
-            if (ifa.ifa_addr == null) continue;
-            const sa = ifa.ifa_addr.?;
-            if (sa.family != AF_INET6) continue;
-            const sin6: *align(1) const SockaddrIn6 = @ptrCast(ifa.ifa_addr.?);
-            if (!isLinkLocal(&sin6.addr)) continue;
+        for (raw) |ifa| {
+            const name = ifa.name;
 
             // Interface must be up, running, multicast-capable, non-P2P.
-            if (ifa.ifa_flags & IFF_UP == 0) continue;
-            if (ifa.ifa_flags & IFF_RUNNING == 0) continue;
-            if (ifa.ifa_flags & IFF_MULTICAST == 0) continue;
-            if (ifa.ifa_flags & IFF_POINTOPOINT != 0) continue;
+            if (!ifa.up) continue;
+            if (!ifa.running) continue;
+            if (!ifa.multicast) continue;
+            if (ifa.pointopoint) continue;
 
             // Match against config (first matching entry wins, like the ref).
             var cfg: ?*const node.config.MulticastInterfaceConfig = null;
@@ -412,9 +599,7 @@ pub const Multicast = struct {
             }
             const mc = cfg orelse continue;
 
-            const raw_idx = c.if_nametoindex(ifa.ifa_name);
-            if (raw_idx <= 0) continue;
-            const idx: u32 = @intCast(raw_idx);
+            const idx = ifa.index;
             var hash: [64]u8 = undefined;
             if (mc.password.len == 0) {
                 std.crypto.hash.blake2.Blake2b512.hash(&self.our_key, &hash, .{});
@@ -430,7 +615,7 @@ pub const Multicast = struct {
             self.interfaces.append(self.gpa, .{
                 .name = name_dup,
                 .index = idx,
-                .addr = sin6.addr,
+                .addr = ifa.addr,
                 .beacon = mc.beacon,
                 .listen = mc.listen,
                 .port = mc.port,
@@ -442,7 +627,6 @@ pub const Multicast = struct {
                 self.gpa.free(pw_dup);
                 continue;
             };
-
         }
         self.reconcileMemberships();
     }
@@ -483,7 +667,7 @@ pub const Multicast = struct {
     /// other failure is reported, unlike the reference which discards them all.
     fn setMembership(self: *Multicast, idx: u32, opt: u32) bool {
         var mreq = ipv6_mreq{ .multiaddr = MULTICAST_GROUP, .interface = idx };
-        if (c.setsockopt(self.sock, c.IPPROTO.IPV6, opt, &mreq, @sizeOf(ipv6_mreq)) == 0) return true;
+        if (c.setsockopt(self.sock, IPPROTO_IPV6, opt, &mreq, @sizeOf(ipv6_mreq)) == 0) return true;
         const err = std.c._errno().*;
         if (opt == IPV6_JOIN_GROUP and err == @intFromEnum(std.c.E.ADDRINUSE)) return true;
         std.debug.print("[ygg] multicast: setsockopt({s}) on ifindex {d} failed: {d}\n", .{

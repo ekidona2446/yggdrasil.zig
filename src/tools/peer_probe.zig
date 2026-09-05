@@ -54,6 +54,15 @@ const Fd = if (is_windows) win.SOCKET else c_int;
 
 const READ_TIMEOUT_MS: i32 = 10_000; // per-read (and per handshake pump) timeout
 
+/// `quic.Client.sock` is a `posix.socket_t`, which is a small integer on POSIX
+/// and a `HANDLE` on Windows (the `SOCKET` reinterpreted as a pointer, as
+/// `quic.socketFromRc` builds it). `Fd` here is this tool's own handle type, so
+/// the QUIC socket is adapted at the boundary rather than passed through.
+fn quicFd(sock: std.posix.socket_t) Fd {
+    if (comptime is_windows) return @intFromPtr(sock);
+    return @intCast(sock);
+}
+
 fn monotonicNanos() u64 {
     return timemod.monotonicNanos();
 }
@@ -275,7 +284,7 @@ const QuicStream = struct {
     scratch: [2048]u8 = undefined,
 
     fn fd(self: *const QuicStream) Fd {
-        return @intCast(self.client.sock);
+        return quicFd(self.client.sock);
     }
 
     fn pump(self: *QuicStream) void {
@@ -584,14 +593,24 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
 
-    if (is_scheme(scheme, "tls") or is_scheme(scheme, "wss")) {
+    // `socks://` / `sockstls://`: the socket is connected to the *proxy*, so
+    // negotiate the tunnel to the peer named by the URI path first. Everything
+    // after that is byte-for-byte what a direct connection would do.
+    if (socksScheme(scheme)) {
+        socksHandshake(&raw, parsed.path, parsed.user, parsed.pass) catch |e| {
+            std.debug.print("FAIL|socks|{s}\n", .{@errorName(e)});
+            return;
+        };
+    }
+
+    if (is_scheme(scheme, "tls") or is_scheme(scheme, "wss") or is_scheme(scheme, "sockstls")) {
         var tls_client = initTls(gpa, &our_id, parsed.host) catch |e| {
             std.debug.print("FAIL|tls_init|{s}\n", .{@errorName(e)});
             return;
         };
         defer tls_client.deinit(gpa);
 
-        if (is_scheme(scheme, "tls")) {
+        if (is_scheme(scheme, "tls") or is_scheme(scheme, "sockstls")) {
             probeTls(&raw, &tls_client, &our_id, password, gpa, t0) catch |e| {
                 std.debug.print("FAIL|tls|{s}\n", .{@errorName(e)});
                 return;
@@ -622,6 +641,52 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
+fn socksScheme(scheme: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(scheme, "socks") or std.ascii.eqlIgnoreCase(scheme, "sockstls");
+}
+
+/// Fill `buf[from..to]`. SOCKS replies are short but can arrive in more than
+/// one segment, so this loops instead of trusting a single `read`, and it
+/// never re-reads bytes that are already in the buffer (the CONNECT reply's
+/// length is only known from its header, so it is read in two steps).
+fn socksFill(raw: *RawStream, buf: []u8, from: usize, to: usize) !void {
+    var got = from;
+    while (got < to) {
+        const n = try raw.read(buf[got..to]);
+        if (n == 0) return error.UnexpectedEndOfStream;
+        got += n;
+    }
+}
+
+/// Blocking SOCKS5 negotiation on an already-connected socket: offer methods,
+/// authenticate if the proxy asks for it, then CONNECT to the peer named by the
+/// URI path. The wire format comes from `node.socks`; this only moves bytes.
+fn socksHandshake(raw: *RawStream, path: []const u8, user: []const u8, pass: []const u8) !void {
+    const target = node.socks.parseTarget(path) catch return error.InvalidURI;
+    var out: [512]u8 = undefined;
+    var in: [512]u8 = undefined;
+
+    const greet = try node.socks.greeting(&out, user.len > 0);
+    try raw.writeAll(greet);
+    try socksFill(raw, &in, 0, 2);
+    const method = try node.socks.selectedMethod(in[0..2]);
+
+    if (method == node.socks.METHOD_USERPASS) {
+        const auth = try node.socks.authRequest(&out, user, pass);
+        try raw.writeAll(auth);
+        try socksFill(raw, &in, 0, 2);
+        if (!(try node.socks.authSucceeded(in[0..2]))) return error.SocksAuthFailed;
+    }
+
+    const request = try node.socks.connectRequest(&out, target);
+    try raw.writeAll(request);
+    // Header first (it says how long the rest is), then the address + port.
+    try socksFill(raw, &in, 0, 4);
+    const total = try node.socks.replyLength(in[0..4]);
+    try socksFill(raw, &in, 4, total);
+    try node.socks.replyOk(in[0..total]);
+}
+
 fn runQuic(gpa: std.mem.Allocator, our_id: *const Crypto, password: []const u8, host: []const u8, peer: std.Io.net.IpAddress, t0: u64) !void {
     const client = node.quic.createClient(gpa, host, peer) catch |e| {
         std.debug.print("FAIL|quic_create|{s}\n", .{@errorName(e)});
@@ -643,7 +708,7 @@ fn runQuic(gpa: std.mem.Allocator, our_id: *const Crypto, password: []const u8, 
             stream.deinit();
             return;
         }
-        if (!waitReadable(client.sock, 100)) continue;
+        if (!waitReadable(quicFd(client.sock), 100)) continue;
     }
 
     const sid = client.quic.tryOpenLocalBidiStream() catch |e| {

@@ -70,6 +70,7 @@ fn socketDomain(ip: std.Io.net.IpAddress) u32 {
 
 const SOCK_DGRAM: u32 = if (builtin.os.tag == .windows) 2 else std.posix.SOCK.DGRAM;
 
+
 /// Create a non-blocking, wildcard-bound UDP socket in `ip`'s family.
 ///
 /// zquic's own `Client.initInPlace` / `Server.init` always create an
@@ -84,7 +85,7 @@ pub fn createUdpSocket(gpa: std.mem.Allocator, family_ip: std.Io.net.IpAddress) 
     const domain = socketDomain(family_ip);
     const rc = std.posix.system.socket(domain, SOCK_DGRAM, 0);
     if (rc < 0) return error.SocketCreateFailed;
-    const sock: std.posix.socket_t = @intCast(rc);
+    const sock = udp_io.socketFromRc(rc);
     errdefer closeSocket(sock);
 
     // Allow several listeners on one port across interfaces, as the reference
@@ -115,7 +116,7 @@ pub fn createUdpSocket(gpa: std.mem.Allocator, family_ip: std.Io.net.IpAddress) 
 pub fn createBoundUdpSocket(port: u16) !std.posix.socket_t {
     const rc = std.posix.system.socket(std.posix.AF.INET, SOCK_DGRAM, 0);
     if (rc < 0) return error.SocketCreateFailed;
-    const sock: std.posix.socket_t = @intCast(rc);
+    const sock = udp_io.socketFromRc(rc);
     errdefer closeSocket(sock);
 
     const wildcard = addressFromIp(.{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = port } });
@@ -127,7 +128,7 @@ pub fn createBoundUdpSocket(port: u16) !std.posix.socket_t {
 }
 
 pub fn closeSocket(sock: std.posix.socket_t) void {
-    _ = std.posix.system.close(sock);
+    udp_io.closeSocketFd(sock);
 }
 
 // ---------------------------------------------------------------------------

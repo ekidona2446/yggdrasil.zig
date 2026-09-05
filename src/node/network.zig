@@ -15,6 +15,7 @@ const tls_wolfssl = @import("tls_wolfssl.zig");
 const ws = @import("ws.zig");
 const quic_mod = @import("quic.zig");
 const unix_socket = @import("unix_socket.zig");
+const socks = @import("socks.zig");
 
 const Core = node.core.Core;
 const Metadata = node.version.Metadata;
@@ -64,6 +65,13 @@ pub const LinkOptions = struct {
     use_quic: bool = false,
     /// Unix domain socket instead of TCP (`unix://`).
     use_unix: bool = false,
+    /// Tunnel through a SOCKS5 proxy (`socks://`, `sockstls://`). The proxy is
+    /// the URI's `host:port`; `socks_target` is the peer we ask it to reach,
+    /// taken from the URI path like the reference does.
+    use_socks: bool = false,
+    socks_target: []const u8 = "",
+    socks_user: []const u8 = "",
+    socks_pass: []const u8 = "",
     /// HTTP path for the WebSocket upgrade (default `/`).
     ws_path: []const u8 = "/",
     /// Host header / SNI name for WebSocket/TLS (not necessarily an IP).
@@ -206,6 +214,10 @@ pub const ParsedURI = struct {
     host: []const u8,
     port: u16,
     path: []const u8,
+    /// `user:password@` userinfo, as `url.URL.User` in the reference. Only
+    /// `socks://` uses it (as proxy credentials); empty for every other scheme.
+    user: []const u8 = "",
+    pass: []const u8 = "",
 };
 
 pub fn parsePeerURI(uri: []const u8) LinkError!ParsedURI {
@@ -214,22 +226,40 @@ pub fn parsePeerURI(uri: []const u8) LinkError!ParsedURI {
     // unknown one reports "link schema unknown" rather than a parse error.
     const scheme_end = std.mem.indexOf(u8, uri, "://") orelse return error.UnknownScheme;
     const scheme = uri[0..scheme_end];
-    const known = [_][]const u8{ "tcp", "tls", "unix", "ws", "wss", "quic" };
+    const known = [_][]const u8{ "tcp", "tls", "unix", "ws", "wss", "quic", "socks", "sockstls" };
     var known_scheme = false;
     for (known) |k| {
         if (std.ascii.eqlIgnoreCase(scheme, k)) known_scheme = true;
     }
     if (!known_scheme) return error.UnknownScheme;
     const rest = uri[scheme_end + 3 ..];
-    const addr_part = if (std.mem.indexOfScalar(u8, rest, '?')) |qpos| rest[0..qpos] else rest;
+    var addr_part = if (std.mem.indexOfScalar(u8, rest, '?')) |qpos| rest[0..qpos] else rest;
+
+    // Userinfo precedes the host and ends at the last `@` *before* the path
+    // (`socks://user:pass@proxy:1080/peer:1234`). It is not stripped by simple
+    // prefix handling because the path may itself contain an `@`.
+    var user: []const u8 = "";
+    var pass: []const u8 = "";
+    const head = if (std.mem.indexOfScalar(u8, addr_part, '/')) |slash| addr_part[0..slash] else addr_part;
+    if (std.mem.lastIndexOfScalar(u8, head, '@')) |at| {
+        const ui = head[0..at];
+        if (std.mem.indexOfScalar(u8, ui, ':')) |colon| {
+            user = ui[0..colon];
+            pass = ui[colon + 1 ..];
+        } else {
+            user = ui;
+        }
+        addr_part = addr_part[at + 1 ..];
+    }
+
     if (std.ascii.eqlIgnoreCase(scheme, "unix")) {
         // `unix:///path/to.sock` / `unix://@abstract` have no `host:port`;
         // the whole remainder is the socket path.
         if (addr_part.len == 0) return error.InvalidURI;
-        return .{ .scheme = scheme, .host = addr_part, .port = 0, .path = "/" };
+        return .{ .scheme = scheme, .host = addr_part, .port = 0, .path = "/", .user = user, .pass = pass };
     }
     const hp = try extractHostPort(addr_part);
-    return .{ .scheme = scheme, .host = hp.host, .port = hp.port, .path = hp.path };
+    return .{ .scheme = scheme, .host = hp.host, .port = hp.port, .path = hp.path, .user = user, .pass = pass };
 }
 
 const HostPort = struct { host: []const u8, port: u16, path: []const u8 };
@@ -256,10 +286,14 @@ fn extractHostPort(addr_part: []const u8) LinkError!HostPort {
         const port = std.fmt.parseInt(u16, split.hp, 10) catch return error.InvalidURI;
         return .{ .host = addr_part[1..closing], .port = port, .path = split.path };
     } else {
-        const colon = std.mem.lastIndexOfScalar(u8, addr_part, ':') orelse return error.InvalidURI;
-        const split = stripPath(addr_part[colon + 1 ..]);
-        const port = std.fmt.parseInt(u16, split.hp, 10) catch return error.InvalidURI;
-        return .{ .host = addr_part[0..colon], .port = port, .path = split.path };
+        // The path is split off *before* looking for the port colon: a
+        // `socks://proxy:1080/peer:1234` URI has a colon inside its path, and
+        // treating that one as the port separator would make the host
+        // `proxy:1080/peer` (which then fails to resolve).
+        const split = stripPath(addr_part);
+        const colon = std.mem.lastIndexOfScalar(u8, split.hp, ':') orelse return error.InvalidURI;
+        const port = std.fmt.parseInt(u16, split.hp[colon + 1 ..], 10) catch return error.InvalidURI;
+        return .{ .host = split.hp[0..colon], .port = port, .path = split.path };
     }
 }
 
@@ -514,6 +548,38 @@ const DialState = struct {
     timer_completion: xev.Completion = undefined,
     connect_completion: xev.Completion = undefined,
     tcp: xev.TCP = undefined,
+
+    // ---- SOCKS5 handshake state (only used for `socks://` / `sockstls://`) --
+    // The tunnel negotiation runs on the same socket before the ironwood
+    // handshake does, so it needs its own completion slot: the connect
+    // completion is already done by then, and `spawnConn`'s read/write slots
+    // belong to the `PeerConn` that does not exist yet.
+    socks_stage: SocksStage = .none,
+    socks_completion: xev.Completion = undefined,
+    /// Bytes already read for the stage currently in flight.
+    socks_recv: std.ArrayListUnmanaged(u8) = .empty,
+    /// Outgoing request bytes, which must outlive the write completion.
+    socks_out: [socks_buf_len]u8 = undefined,
+    socks_out_len: usize = 0,
+    /// Scratch for the reply currently being read (`socks_recv` accumulates
+    /// across reads, this is only the read window).
+    socks_in: [socks_buf_len]u8 = undefined,
+};
+
+/// Buffer for SOCKS request/response bytes. The largest thing we ever build is
+/// a CONNECT request with a 255-byte domain name (4 + 1 + 255 + 2), and the
+/// largest reply is 4 + 1 + 255 + 2 as well.
+const socks_buf_len: usize = 320;
+
+/// Where a `socks://` dial is inside RFC 1928.
+const SocksStage = enum {
+    none,
+    /// Greeting sent, waiting for the two-byte method selection.
+    method,
+    /// Username/password sub-negotiation sent, waiting for its two-byte reply.
+    auth,
+    /// CONNECT sent, waiting for the reply (4-byte header + address + port).
+    connect,
 };
 
 /// One outbound `quic://` peer. zquic owns the UDP socket; we poll it with
@@ -731,10 +797,40 @@ pub const NetworkManager = struct {
         options.use_ws = std.mem.eql(u8, parsed.scheme, "ws") or std.mem.eql(u8, parsed.scheme, "wss");
         options.use_quic = std.mem.eql(u8, parsed.scheme, "quic");
         options.use_unix = std.mem.eql(u8, parsed.scheme, "unix");
+        // `socks://` tunnels to the peer named by the path; `sockstls://` is
+        // the same plus a TLS session over the tunnel (SNI defaults to the
+        // proxy hostname, overridable with `?sni=`, exactly like the
+        // reference's `linkSOCKS.dial`).
+        options.use_socks = std.mem.eql(u8, parsed.scheme, "socks") or std.mem.eql(u8, parsed.scheme, "sockstls");
+        if (std.mem.eql(u8, parsed.scheme, "sockstls")) options.use_tls = true;
         options.ws_path = parsed.path;
         options.ws_host = parsed.host;
         options.uri = try normalizePeerUri(self.gpa, uri);
         errdefer self.gpa.free(options.uri);
+
+        if (options.use_socks) {
+            // A `socks://` URI without a peer address in the path has nothing
+            // to tunnel to, so reject it while the caller can still report it
+            // (the reference would only fail once the handshake ran).
+            _ = socks.parseTarget(parsed.path) catch return error.InvalidURI;
+            options.socks_target = try self.gpa.dupe(u8, parsed.path);
+            errdefer self.gpa.free(options.socks_target);
+            options.socks_user = try self.gpa.dupe(u8, parsed.user);
+            errdefer self.gpa.free(options.socks_user);
+            options.socks_pass = try self.gpa.dupe(u8, parsed.pass);
+            errdefer self.gpa.free(options.socks_pass);
+        }
+
+        // `unix://` needs AF_UNIX, which only Unix-like targets provide
+        // (see `unix_socket.supported`). Refuse it there rather than let a
+        // peer URI silently never connect.
+        if (comptime !unix_socket.supported) {
+            if (options.use_unix) {
+                unix_socket.reportUnsupported("peer", options.uri);
+                // `options.uri` is released by the `errdefer` above.
+                return error.NotSupported;
+            }
+        }
 
         // Refuse a duplicate the way the reference does (`link already exists`),
         // so `addPeer` over the admin socket reports the same thing.
@@ -797,6 +893,10 @@ pub const NetworkManager = struct {
         if (dial.options.password.len > 0) self.gpa.free(dial.options.password);
         if (dial.options.sintf.len > 0) self.gpa.free(dial.options.sintf);
         if (dial.options.pinned_keys.len > 0) self.gpa.free(dial.options.pinned_keys);
+        if (dial.options.socks_target.len > 0) self.gpa.free(dial.options.socks_target);
+        if (dial.options.socks_user.len > 0) self.gpa.free(dial.options.socks_user);
+        if (dial.options.socks_pass.len > 0) self.gpa.free(dial.options.socks_pass);
+        dial.socks_recv.deinit(self.gpa);
         dial.timer.deinit();
         self.gpa.destroy(dial);
     }
@@ -908,10 +1008,237 @@ pub const NetworkManager = struct {
             return .disarm;
         };
         dial.backoff_ns = MINIMUM_BACKOFF_NS; // reset on success
+        if (dial.options.use_socks) {
+            // The socket is connected to the *proxy*; the ironwood handshake
+            // only starts once SOCKS says the tunnel to the peer is up.
+            startSocksHandshake(dial, tcp);
+            return .disarm;
+        }
         dial.manager.spawnConn(tcp, dial.options, dial) catch |err| {
             logInfo("spawnConn failed: {}", .{err});
         };
         return .disarm;
+    }
+
+    // -----------------------------------------------------------------
+    // SOCKS5 tunnel negotiation (socks://, sockstls://)
+    // -----------------------------------------------------------------
+
+    /// Kick off RFC 1928: offer authentication methods, then authenticate if
+    /// the proxy wants username/password, then CONNECT to the peer named by
+    /// the URI path. Every step is a libxev read/write completion on the same
+    /// socket, so the event loop is never blocked.
+    fn startSocksHandshake(dial: *DialState, tcp: xev.TCP) void {
+        dial.tcp = tcp;
+        // Held for the duration of the negotiation and released when the last
+        // stage hands the socket over to `spawnConn` (or gives up).
+        refDial(dial);
+        dial.socks_stage = .method;
+        dial.socks_recv.clearRetainingCapacity();
+        dial.socks_out_len = 0;
+        const body = socks.greeting(&dial.socks_out, dial.options.socks_user.len > 0) catch |err| {
+            logInfo("socks greeting failed: {}", .{err});
+            finishSocksFailure(dial);
+            return;
+        };
+        dial.socks_out_len = body.len;
+        socksWrite(dial);
+    }
+
+    fn socksWrite(dial: *DialState) void {
+        dial.tcp.write(
+            dial.manager.loop,
+            &dial.socks_completion,
+            .{ .slice = dial.socks_out[0..dial.socks_out_len] },
+            DialState,
+            dial,
+            onSocksWrite,
+        );
+    }
+
+    fn onSocksWrite(ud: ?*DialState, loop: *xev.Loop, c: *xev.Completion, tcp: xev.TCP, buf: xev.WriteBuffer, r: xev.WriteError!usize) xev.CallbackAction {
+        _ = loop;
+        _ = c;
+        _ = tcp;
+        _ = buf;
+        const dial = ud.?;
+        const n = r catch |err| {
+            logInfo("socks write to {s}:{d} failed: {}", .{ dial.host, dial.port, err });
+            finishSocksFailure(dial);
+            return .disarm;
+        };
+        // The requests are a handful of bytes, so a short write means the
+        // proxy saw a partial message: give up on this attempt and let the
+        // normal redial backoff retry the whole thing.
+        if (n < dial.socks_out_len) {
+            logInfo("socks: short write to {s}:{d}", .{ dial.host, dial.port });
+            finishSocksFailure(dial);
+            return .disarm;
+        }
+        socksReadMore(dial);
+        return .disarm;
+    }
+
+    /// Read until the stage in flight has all the bytes it needs.
+    fn socksReadMore(dial: *DialState) void {
+        const need = socksNeedBytes(dial);
+        if (need == 0 or dial.socks_recv.items.len >= need) {
+            socksStageComplete(dial);
+            return;
+        }
+        // Read at most the bytes this stage still needs, into the read
+        // scratch; whatever arrives is appended to `socks_recv`, which is
+        // what the stages interpret (`socks_out` keeps the request that a
+        // write completion may still be pointing at).
+        const have = dial.socks_recv.items.len;
+        const space = dial.socks_in[0 .. need - have];
+        dial.tcp.read(
+            dial.manager.loop,
+            &dial.socks_completion,
+            .{ .slice = space },
+            DialState,
+            dial,
+            onSocksRead,
+        );
+    }
+
+    fn onSocksRead(ud: ?*DialState, loop: *xev.Loop, c: *xev.Completion, tcp: xev.TCP, buf: xev.ReadBuffer, r: xev.ReadError!usize) xev.CallbackAction {
+        _ = loop;
+        _ = c;
+        _ = tcp;
+        const dial = ud.?;
+        const n = r catch |err| {
+            logInfo("socks read from {s}:{d} failed: {}", .{ dial.host, dial.port, err });
+            finishSocksFailure(dial);
+            return .disarm;
+        };
+        if (n == 0) {
+            logInfo("socks: {s}:{d} closed during handshake", .{ dial.host, dial.port });
+            finishSocksFailure(dial);
+            return .disarm;
+        }
+        dial.socks_recv.appendSlice(dial.manager.gpa, buf.slice[0..n]) catch |err| {
+            logInfo("socks read: {}", .{err});
+            finishSocksFailure(dial);
+            return .disarm;
+        };
+        socksStageComplete(dial);
+        return .disarm;
+    }
+
+    /// Minimum bytes the current stage must have before it can be interpreted.
+    /// For the CONNECT reply the header decides the real length, so a short
+    /// read is normal there and `socksStageComplete` asks for more.
+    fn socksNeedBytes(dial: *DialState) usize {
+        return switch (dial.socks_stage) {
+            .none => 0,
+            .method, .auth => 2,
+            .connect => if (socks.replyLength(dial.socks_recv.items)) |n| n else |_| 4,
+        };
+    }
+
+    fn socksStageComplete(dial: *DialState) void {
+        const received = dial.socks_recv.items;
+        switch (dial.socks_stage) {
+            .none => finishSocksFailure(dial),
+            .method => {
+                const method = socks.selectedMethod(received[0..2]) catch |err| {
+                    logInfo("socks: {s}:{d} method selection failed: {}", .{ dial.host, dial.port, err });
+                    finishSocksFailure(dial);
+                    return;
+                };
+                dial.socks_recv.clearRetainingCapacity();
+                if (method == socks.METHOD_USERPASS) {
+                    socksSendAuth(dial);
+                    return;
+                }
+                socksSendConnect(dial);
+            },
+            .auth => {
+                const ok = socks.authSucceeded(received[0..2]) catch |err| {
+                    logInfo("socks: {s}:{d} auth reply: {}", .{ dial.host, dial.port, err });
+                    finishSocksFailure(dial);
+                    return;
+                };
+                dial.socks_recv.clearRetainingCapacity();
+                if (!ok) {
+                    logInfo("socks: {s}:{d} rejected the proxy credentials", .{ dial.host, dial.port });
+                    finishSocksFailure(dial);
+                    return;
+                }
+                socksSendConnect(dial);
+            },
+            .connect => {
+                const need = socks.replyLength(received) catch |err| {
+                    logInfo("socks: {s}:{d} bad reply: {}", .{ dial.host, dial.port, err });
+                    finishSocksFailure(dial);
+                    return;
+                };
+                if (received.len < need) {
+                    socksReadMore(dial);
+                    return;
+                }
+                socks.replyOk(received) catch {
+                    const rep = received[1];
+                    logInfo("socks: {s}:{d} CONNECT to {s} failed: {s} (0x{x})", .{
+                        dial.host, dial.port, dial.options.socks_target, socks.replyText(rep), rep,
+                    });
+                    finishSocksFailure(dial);
+                    return;
+                };
+                // Tunnel established: the socket now speaks to the peer, so
+                // hand it to the normal connection path (which adds TLS for
+                // `sockstls://` and then the ironwood handshake).
+                const tcp = dial.tcp;
+                dial.socks_stage = .none;
+                dial.socks_recv.clearRetainingCapacity();
+                dial.manager.spawnConn(tcp, dial.options, dial) catch |err| {
+                    logInfo("spawnConn failed after socks: {}", .{err});
+                };
+                dial.manager.releaseDialRef(dial);
+            },
+        }
+    }
+
+    fn socksSendAuth(dial: *DialState) void {
+        dial.socks_stage = .auth;
+        const body = socks.authRequest(
+            &dial.socks_out,
+            dial.options.socks_user,
+            dial.options.socks_pass,
+        ) catch |err| {
+            logInfo("socks auth request failed: {}", .{err});
+            finishSocksFailure(dial);
+            return;
+        };
+        dial.socks_out_len = body.len;
+        socksWrite(dial);
+    }
+
+    fn socksSendConnect(dial: *DialState) void {
+        const target = socks.parseTarget(dial.options.socks_target) catch |err| {
+            logInfo("socks: bad target {s}: {}", .{ dial.options.socks_target, err });
+            finishSocksFailure(dial);
+            return;
+        };
+        dial.socks_stage = .connect;
+        const body = socks.connectRequest(&dial.socks_out, target) catch |err| {
+            logInfo("socks connect request failed: {}", .{err});
+            finishSocksFailure(dial);
+            return;
+        };
+        dial.socks_out_len = body.len;
+        socksWrite(dial);
+    }
+
+    /// Abandon this attempt: drop the negotiation's reference and let the
+    /// normal backoff retry the whole dial (connect included).
+    fn finishSocksFailure(dial: *DialState) void {
+        dial.socks_stage = .none;
+        dial.socks_recv.clearRetainingCapacity();
+        dial.last_error = true;
+        scheduleRedial(dial);
+        dial.manager.releaseDialRef(dial);
     }
 
     fn scheduleRedial(dial: *DialState) void {
@@ -953,6 +1280,11 @@ pub const NetworkManager = struct {
         // and expects TLS termination to happen in a reverse proxy in front of
         // a plain `ws://` listener. Dialing `wss://` peers still works (see
         // `addOutboundPeer`).
+        // The reference has no SOCKS listener (`linkSOCKS.listen` returns
+        // "SOCKS listener not supported"), so refuse it rather than bind
+        // something that is not a proxy.
+        if (std.mem.eql(u8, parsed.scheme, "socks") or std.mem.eql(u8, parsed.scheme, "sockstls"))
+            return error.NotSupported;
         if (std.mem.eql(u8, parsed.scheme, "wss")) return error.NotSupported;
 
         var options = try parseLinkQuery(self.gpa, uri, .{
@@ -978,6 +1310,12 @@ pub const NetworkManager = struct {
         }
 
         if (options.use_unix) {
+            if (comptime !unix_socket.supported) {
+                // Same refusal as for an outbound `unix://` peer: say so once,
+                // then let the caller log it and carry on without the listener.
+                unix_socket.reportUnsupported("listener", options.uri);
+                return error.NotSupported;
+            }
             // Unix domain socket listener: no DNS, no host/port.
             const addr = unix_socket.Address.init(parsed.host) catch return error.InvalidURI;
             unix_socket.cleanupStale(addr);
@@ -2216,17 +2554,15 @@ fn formatIpv6(bytes: *const [16]u8, buf: []u8) ![]u8 {
     return buf[0..w.end];
 }
 
-/// The socket handle behind an `xev.TCP`. libxev stores a `posix.socket_t` on
-/// epoll/kqueue/io_uring and a `HANDLE` on IOCP, where for sockets the HANDLE
-/// is the SOCKET reinterpreted, so `@intFromPtr` recovers it.
-fn tcpFd(tcp: xev.TCP) switch (builtin.os.tag) {
-    .windows => std.os.windows.ws2_32.SOCKET,
-    else => std.posix.socket_t,
-} {
-    return switch (builtin.os.tag) {
-        .windows => @bitCast(@intFromPtr(tcp.fd)),
-        else => tcp.fd,
-    };
+/// The socket handle behind an `xev.TCP`.
+///
+/// libxev stores a `posix.socket_t`, which is a small integer on every
+/// Unix-like target and a `HANDLE` (the `SOCKET` reinterpreted as a pointer)
+/// on Windows' IOCP backend. Both are `std.posix.socket_t` as far as this file
+/// is concerned -- `std.c`'s socket calls take `fd_t`, which is the same type
+/// on Windows (`HANDLE`) -- so the handle is handed through unchanged.
+fn tcpFd(tcp: xev.TCP) std.posix.socket_t {
+    return tcp.fd;
 }
 
 /// The port a listener's socket is actually bound to (resolving `:0` /
@@ -2236,7 +2572,7 @@ fn listenerBoundPort(tcp: xev.TCP) u16 {
     var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
     switch (builtin.os.tag) {
         .windows => {
-            if (std.os.windows.ws2_32.getsockname(tcpFd(tcp), @ptrCast(&storage), &len) != 0) return 0;
+            if (std.c.getsockname(tcpFd(tcp), @ptrCast(&storage), &len) != 0) return 0;
         },
         else => {
             if (std.c.getsockname(tcpFd(tcp), @ptrCast(&storage), &len) != 0) return 0;
@@ -2262,7 +2598,7 @@ fn remoteAddrString(gpa: std.mem.Allocator, tcp: xev.TCP) ?[]u8 {
     var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
     switch (builtin.os.tag) {
         .windows => {
-            if (std.os.windows.ws2_32.getpeername(tcpFd(tcp), @ptrCast(&storage), &len) != 0) return null;
+            if (std.c.getpeername(tcpFd(tcp), @ptrCast(&storage), &len) != 0) return null;
         },
         else => std.posix.getpeername(tcpFd(tcp), @ptrCast(&storage), &len) catch return null,
     }

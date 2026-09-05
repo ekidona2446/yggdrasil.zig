@@ -47,14 +47,30 @@ pub const LinkOptions = struct {
 
 /// Parse a peer URI like "tcp://host:port", "ws://host:port/path", or
 /// "quic://host:port" into a scheme, host, port, and HTTP path.
-pub fn parsePeerURI(uri: []const u8) !struct { scheme: []const u8, host: []const u8, port: u16, path: []const u8, options: LinkOptions } {
-    // Format: scheme://[host]:port[/path]?key=val...
+pub fn parsePeerURI(uri: []const u8) !struct { scheme: []const u8, host: []const u8, port: u16, path: []const u8, user: []const u8, pass: []const u8, options: LinkOptions } {
+    // Format: scheme://[user:pass@][host]:port[/path]?key=val...
     const scheme_end = std.mem.indexOf(u8, uri, "://") orelse return error.InvalidURI;
     const scheme = uri[0..scheme_end];
     const rest = uri[scheme_end + 3 ..];
 
     // Split on '?' for query params
-    const addr_part = if (std.mem.indexOfScalar(u8, rest, '?')) |qpos| rest[0..qpos] else rest;
+    var addr_part = if (std.mem.indexOfScalar(u8, rest, '?')) |qpos| rest[0..qpos] else rest;
+
+    // Userinfo (`socks://user:pass@proxy:1080/peer:1234`): it ends at the last
+    // `@` before the path, since the path itself may contain one.
+    var user: []const u8 = "";
+    var pass: []const u8 = "";
+    const head = if (std.mem.indexOfScalar(u8, addr_part, '/')) |slash| addr_part[0..slash] else addr_part;
+    if (std.mem.lastIndexOfScalar(u8, head, '@')) |at| {
+        const ui = head[0..at];
+        if (std.mem.indexOfScalar(u8, ui, ':')) |colon| {
+            user = ui[0..colon];
+            pass = ui[colon + 1 ..];
+        } else {
+            user = ui;
+        }
+        addr_part = addr_part[at + 1 ..];
+    }
 
     // Extract host and port
     const hp = extractHostPort(addr_part) catch return error.InvalidURI;
@@ -63,6 +79,8 @@ pub fn parsePeerURI(uri: []const u8) !struct { scheme: []const u8, host: []const
         .host = hp.host,
         .port = hp.port,
         .path = hp.path,
+        .user = user,
+        .pass = pass,
         .options = LinkOptions{},
     };
 }
@@ -172,9 +190,12 @@ fn extractHostPort(addr_part: []const u8) !HostPort {
         const split = stripPath(after_bracket[1..]);
         return HostPort{ .host = addr_part[1..closing], .port = try std.fmt.parseInt(u16, split.hp, 10), .path = split.path };
     } else {
-        const colon = std.mem.lastIndexOfScalar(u8, addr_part, ':') orelse return error.InvalidURI;
-        const split = stripPath(addr_part[colon + 1 ..]);
-        return HostPort{ .host = addr_part[0..colon], .port = try std.fmt.parseInt(u16, split.hp, 10), .path = split.path };
+        // Split the path off first: `socks://proxy:1080/peer:1234` has a colon
+        // in its path, and using that one as the port separator would leave the
+        // host as `proxy:1080/peer`.
+        const split = stripPath(addr_part);
+        const colon = std.mem.lastIndexOfScalar(u8, split.hp, ':') orelse return error.InvalidURI;
+        return HostPort{ .host = split.hp[0..colon], .port = try std.fmt.parseInt(u16, split.hp[colon + 1 ..], 10), .path = split.path };
     }
 }
 

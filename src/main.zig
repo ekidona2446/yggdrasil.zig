@@ -225,8 +225,7 @@ pub fn main(init: std.process.Init) !void {
             if (cfg.tunnel_routing.enable) {
                 // Match the reference's precedence rule: the deprecated
                 // `ipv4_address` is used only when *every* `ip_addresses`
-                // entry is empty (see Yggdrasil-ng `tun.rs`:
-                // `ip_addresses.iter().all(|s| s.is_empty())`).
+                // entry is empty.
                 var all_empty: bool = true;
                 for (cfg.tunnel_routing.ip_addresses) |cidr| {
                     if (cidr.len == 0) continue;

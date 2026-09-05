@@ -85,6 +85,39 @@ const fcntl_fn = struct {
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
 
+/// Windows only. Zig 0.16's std has no winsock bindings at all (no
+/// `ws2_32.closesocket`), and `close()` on a Windows `SOCKET` goes through the
+/// CRT's file-handle path instead of winsock, which leaks the socket. Declare
+/// the one entry point we need the same way `ioctlsocket` is declared above.
+const closesocket_fn = struct {
+    extern "c" fn closesocket(s: std.posix.socket_t) callconv(.c) c_int;
+}.closesocket;
+
+/// Adapt the `c_int` that `socket(2)` returns to `posix.socket_t`.
+///
+/// Every Unix-like target spells a socket as a small integer, but on Windows
+/// `posix.socket_t` is a `HANDLE` -- a pointer with the `SOCKET` value
+/// reinterpreted into it (exactly what libxev's IOCP backend undoes with its
+/// `asSocket`). So the conversion is an int cast on POSIX and an int-to-pointer
+/// reinterpretation on Windows; `@intCast` alone only compiles on the former.
+pub fn socketFromRc(rc: c_int) std.posix.socket_t {
+    if (comptime is_windows) {
+        return @as(std.posix.socket_t, @ptrFromInt(@as(usize, @bitCast(@as(isize, @intCast(rc))))));
+    }
+    return @as(std.posix.socket_t, @intCast(rc));
+}
+
+/// Close a socket descriptor on any platform: `closesocket()` on Windows,
+/// `close()` elsewhere. Every place that owns a socket fd goes through this so
+/// the Windows path cannot be forgotten.
+pub fn closeSocketFd(fd: std.posix.socket_t) void {
+    if (comptime is_windows) {
+        _ = closesocket_fn(fd);
+        return;
+    }
+    _ = std.posix.system.close(fd);
+}
+
 /// Last OS error code. On POSIX this is `errno`, taken through `std.c._errno`
 /// (which already picks `__errno_location` / `__error` / `___errno` per target).
 /// On Windows, socket errors are reported by `WSAGetLastError`, not `errno`,
@@ -155,7 +188,7 @@ test "udp_io: non-blocking drain returns WouldBlock on an empty socket" {
     // WouldBlock rather than stalling the event loop.
     const sock = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
     if (sock < 0) return error.SkipZigTest;
-    defer _ = std.posix.system.close(sock);
+    defer closeSocketFd(sock);
 
     try setNonblocking(@intCast(sock));
 
@@ -170,7 +203,7 @@ test "udp_io: loopback datagram round trip" {
     // connection table on.
     const sock = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
     if (sock < 0) return error.SkipZigTest;
-    defer _ = std.posix.system.close(sock);
+    defer closeSocketFd(sock);
 
     var sa = std.posix.sockaddr.in{
         .family = std.posix.AF.INET,

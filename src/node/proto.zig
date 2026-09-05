@@ -43,9 +43,22 @@ pub const ProtoHandler = struct {
     gpa: std.mem.Allocator,
     /// Callbacks: key -> pending response channel.
     callbacks: std.AutoHashMapUnmanaged(PublicKey, PendingCallback),
+    /// `callbacks` is shared between the event-loop thread (which delivers
+    /// responses) and admin threads (which register requests and poll for the
+    /// reply). A spinlock is enough: every critical section is a hash lookup
+    /// or an insert, never a blocking operation.
+    lock: std.atomic.Value(u8) = .init(0),
 
     pub fn init(gpa: std.mem.Allocator) ProtoHandler {
         return .{ .gpa = gpa, .callbacks = .{} };
+    }
+
+    fn lockShared(self: *ProtoHandler) void {
+        while (self.lock.swap(1, .acquire) != 0) std.atomic.spinLoopHint();
+    }
+
+    fn unlockShared(self: *ProtoHandler) void {
+        self.lock.store(0, .release);
     }
 
     pub fn deinit(self: *ProtoHandler) void {
@@ -147,26 +160,50 @@ pub const ProtoHandler = struct {
     }
 
     fn deliverResponse(self: *ProtoHandler, from_key: PublicKey, data: []const u8) void {
+        self.lockShared();
+        defer self.unlockShared();
         if (self.callbacks.getPtr(from_key)) |cb| {
+            if (cb.data) |old| self.gpa.free(old);
             cb.data = self.gpa.dupe(u8, data) catch null;
         }
     }
 
     /// Register a pending callback. Returns an id for polling.
     pub fn registerCallback(self: *ProtoHandler, target: PublicKey) !void {
+        self.lockShared();
+        defer self.unlockShared();
+        if (self.callbacks.fetchRemove(target)) |kv| {
+            if (kv.value.data) |d| self.gpa.free(d);
+        }
         try self.callbacks.put(self.gpa, target, .{ .data = null, .created_ns = monotonicNs() });
     }
 
-    /// Try to take a completed response. Returns null if not ready yet.
+    /// Try to take a completed response. Returns null while the reply is still
+    /// outstanding - the pending entry is only removed once it carries data, so
+    /// `deliverResponse` can still fill it. The caller owns the returned slice.
     pub fn takeResponse(self: *ProtoHandler, target: PublicKey) ?[]u8 {
-        if (self.callbacks.getPtr(target)) |cb| {
-            return cb.data;
+        self.lockShared();
+        defer self.unlockShared();
+        const cb = self.callbacks.getPtr(target) orelse return null;
+        const data = cb.data orelse return null;
+        cb.data = null;
+        _ = self.callbacks.fetchRemove(target);
+        return data;
+    }
+
+    /// Drop a pending request without taking its response.
+    pub fn removeCallback(self: *ProtoHandler, target: PublicKey) void {
+        self.lockShared();
+        defer self.unlockShared();
+        if (self.callbacks.fetchRemove(target)) |kv| {
+            if (kv.value.data) |d| self.gpa.free(d);
         }
-        return null;
     }
 
     /// Clean up expired callbacks.
     pub fn cleanupExpired(self: *ProtoHandler) void {
+        self.lockShared();
+        defer self.unlockShared();
         const now = monotonicNs();
         var to_remove = std.ArrayListUnmanaged(PublicKey).empty;
         defer to_remove.deinit(self.gpa);
@@ -189,6 +226,48 @@ const PendingCallback = struct {
     data: ?[]u8 = null,
     created_ns: u64,
 };
+
+/// Request payloads this node sends out, mirroring the reference's
+/// `protoHandler.sendGet*Request` (payload only; the session-type byte is
+/// prepended by `Core.writeTo`).
+pub fn makeNodeInfoRequest(gpa: std.mem.Allocator) ![]u8 {
+    return gpa.dupe(u8, &[_]u8{TYPE_PROTO_NODEINFO_REQUEST});
+}
+
+pub fn makeDebugRequest(gpa: std.mem.Allocator, kind: DebugKind) ![]u8 {
+    const sub: u8 = switch (kind) {
+        .get_self => TYPE_DEBUG_GET_SELF_REQUEST,
+        .get_peers => TYPE_DEBUG_GET_PEERS_REQUEST,
+        .get_tree => TYPE_DEBUG_GET_TREE_REQUEST,
+    };
+    return gpa.dupe(u8, &[_]u8{ TYPE_PROTO_DEBUG, sub });
+}
+
+pub const DebugKind = enum { get_self, get_peers, get_tree };
+
+/// True when the message is a *request*, i.e. when `handleMessage` needs this
+/// node's own state (key, routing entries, peer/tree key lists). Responses and
+/// unknown types are handled with empty state, which keeps the receive path
+/// free of allocations in the common case.
+pub fn needsLocalState(payload: []const u8) bool {
+    if (payload.len == 0) return false;
+    return switch (payload[0]) {
+        TYPE_PROTO_NODEINFO_REQUEST => true,
+        TYPE_PROTO_DEBUG => blk: {
+            if (payload.len < 2) break :blk false;
+            break :blk switch (payload[1]) {
+                TYPE_DEBUG_GET_SELF_REQUEST, TYPE_DEBUG_GET_PEERS_REQUEST, TYPE_DEBUG_GET_TREE_REQUEST => true,
+                else => false,
+            };
+        },
+        else => false,
+    };
+}
+
+/// Number of raw 32-byte keys carried by a `getPeers`/`getTree` response.
+pub fn keyListLen(payload: []const u8) usize {
+    return payload.len / 32;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers

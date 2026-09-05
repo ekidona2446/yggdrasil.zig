@@ -18,10 +18,37 @@
 //! stall the event-loop thread and deadlock the node.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const xev = @import("xev");
 
 const posix = std.posix;
 const system = posix.system;
+
+/// Whether this build can actually serve `unix://`.
+///
+/// Windows 10+ does ship an `AF_UNIX`, but it is a partial implementation:
+/// abstract sockets do not exist, the socket file has to live on a filesystem
+/// that supports reparse points, `unlink` of a socket file behaves
+/// inconsistently, and the winsock `AF_UNIX` support is missing on older
+/// builds entirely. Yggdrasil's `unix://` links (and its default admin
+/// listener on Unix) are used as a real transport, so a half-working one is
+/// worse than none: this build reports them as unsupported instead.
+///
+/// The flag is `comptime`-known, so callers gate their `unix://` paths with
+/// `if (comptime unix_socket.supported)` and the socket syscalls below are
+/// never analysed -- let alone emitted -- on Windows. No per-platform stub
+/// file, and no `AF_UNIX` fallback that pretends to work.
+pub const supported: bool = builtin.os.tag != .windows;
+
+/// Print the one notice explaining why a `unix://` URI was ignored. Kept here
+/// (instead of duplicated at each call site) so the wording stays identical
+/// whether it is a peer link or the admin listener that got turned down.
+pub fn reportUnsupported(what: []const u8, uri: []const u8) void {
+    std.log.warn(
+        "unix:// {s} `{s}` ignored: unix domain sockets are only supported on Unix-like systems (this is a {s} build)",
+        .{ what, uri, @tagName(builtin.os.tag) },
+    );
+}
 
 /// Portable `sockaddr_un`. The layout (`sa_family_t` + 108-byte path) is the
 /// same on Linux, macOS and the BSDs; `sa_family_t` is `u16` on all of them.
@@ -42,6 +69,9 @@ pub const Error = error{
     FileNotFound,
     NotDir,
     InvalidPath,
+    /// `unix://` on a platform where `supported` is false (Windows). Every
+    /// entry point returns this instead of touching an `AF_UNIX` syscall.
+    Unsupported,
 } || posix.UnexpectedError;
 
 /// `unix://` address split into a path and whether it is an abstract socket
@@ -54,7 +84,7 @@ pub const Address = struct {
     abstract: bool,
 
     pub fn init(uri_rest: []const u8) Error!Address {
-        // `unix:///abs/path` → `/abs/path`; `unix://@name` → abstract `name`.
+        // `unix:///abs/path` -> `/abs/path`; `unix://@name` -> abstract `name`.
         if (uri_rest.len == 0) return error.InvalidPath;
         if (uri_rest[0] == '@') return .{ .path = uri_rest[1..], .abstract = true };
         return .{ .path = uri_rest, .abstract = false };
@@ -122,7 +152,11 @@ fn setNonBlocking(fd: posix.socket_t) Error!void {
 /// Remove a stale socket file if it exists and is not held by a live process.
 /// Mirrors yggdrasil-go: dial the path, and only unlink it if the dial fails
 /// (a socket file with nobody listening behind it).
+///
+/// No-op where `supported` is false; callers there never reach the point of
+/// binding, so there is nothing to clean up either.
 pub fn cleanupStale(addr: Address) void {
+    if (comptime !supported) return;
     if (addr.abstract) return;
     // `unlink` via the system layer; ignore errors (file may not exist).
     var buf: [108]u8 = undefined;
@@ -134,28 +168,32 @@ pub fn cleanupStale(addr: Address) void {
 /// uses `.accept(...)` exactly as for a TCP listener. Call `cleanupStale`
 /// first if the path may already exist.
 pub fn listener(addr: Address, backlog: u31) Error!xev.TCP {
-    const fd = try socketFd();
-    errdefer _ = system.close(fd);
+    if (comptime supported) {
+        const fd = try socketFd();
+        errdefer _ = system.close(fd);
 
-    var sa: SockaddrUnix = undefined;
-    addr.fill(&sa);
-    const rc = system.bind(fd, @ptrCast(&sa), try addr.socklen());
-    switch (checkRc(rc)) {
-        .SUCCESS => {},
-        .ACCES, .PERM => return error.AccessDenied,
-        .ADDRINUSE => return error.AddressInUse,
-        .ADDRNOTAVAIL, .AFNOSUPPORT => return error.AddressNotAvailable,
-        .NOTDIR, .NOENT => return error.FileNotFound,
-        .ROFS => return error.AccessDenied,
-        else => |err| return posix.unexpectedErrno(err),
+        var sa: SockaddrUnix = undefined;
+        addr.fill(&sa);
+        const rc = system.bind(fd, @ptrCast(&sa), try addr.socklen());
+        switch (checkRc(rc)) {
+            .SUCCESS => {},
+            .ACCES, .PERM => return error.AccessDenied,
+            .ADDRINUSE => return error.AddressInUse,
+            .ADDRNOTAVAIL, .AFNOSUPPORT => return error.AddressNotAvailable,
+            .NOTDIR, .NOENT => return error.FileNotFound,
+            .ROFS => return error.AccessDenied,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+        const lrc = system.listen(fd, backlog);
+        switch (checkRc(lrc)) {
+            .SUCCESS => {},
+            .ADDRINUSE => return error.AddressInUse,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+        return xev.TCP.initFd(fd);
+    } else {
+        return error.Unsupported;
     }
-    const lrc = system.listen(fd, backlog);
-    switch (checkRc(lrc)) {
-        .SUCCESS => {},
-        .ADDRINUSE => return error.AddressInUse,
-        else => |err| return posix.unexpectedErrno(err),
-    }
-    return xev.TCP.initFd(fd);
 }
 
 /// Connect to a unix socket and return it wrapped as an `xev.TCP`. The connect
@@ -163,24 +201,28 @@ pub fn listener(addr: Address, backlog: u31) Error!xev.TCP {
 /// rest of the connection through the returned watcher, which reports
 /// `error.WouldBlock` on its completions until the handshake completes.
 pub fn dial(addr: Address) Error!xev.TCP {
-    const fd = try socketFd();
-    errdefer _ = system.close(fd);
-    try setNonBlocking(fd);
+    if (comptime supported) {
+        const fd = try socketFd();
+        errdefer _ = system.close(fd);
+        try setNonBlocking(fd);
 
-    var sa: SockaddrUnix = undefined;
-    addr.fill(&sa);
-    const rc = system.connect(fd, @ptrCast(&sa), try addr.socklen());
-    switch (checkRc(rc)) {
-        .SUCCESS => {},
-        .INPROGRESS, .AGAIN, .ALREADY => {
-            // Non-blocking connect in flight — expected.
-        },
-        .ACCES, .PERM => return error.AccessDenied,
-        .CONNREFUSED, .NOENT, .NOTDIR => return error.ConnectionRefused,
-        .ISCONN => {},
-        else => |err| return posix.unexpectedErrno(err),
+        var sa: SockaddrUnix = undefined;
+        addr.fill(&sa);
+        const rc = system.connect(fd, @ptrCast(&sa), try addr.socklen());
+        switch (checkRc(rc)) {
+            .SUCCESS => {},
+            .INPROGRESS, .AGAIN, .ALREADY => {
+                // Non-blocking connect in flight — expected.
+            },
+            .ACCES, .PERM => return error.AccessDenied,
+            .CONNREFUSED, .NOENT, .NOTDIR => return error.ConnectionRefused,
+            .ISCONN => {},
+            else => |err| return posix.unexpectedErrno(err),
+        }
+        return xev.TCP.initFd(fd);
+    } else {
+        return error.Unsupported;
     }
-    return xev.TCP.initFd(fd);
 }
 
 test "unix address parsing and socklen" {
@@ -197,4 +239,26 @@ test "unix address parsing and socklen" {
     try testing.expectEqual(@as(posix.socklen_t, @offsetOf(SockaddrUnix, "path") + 1 + "yggdrasil".len), try ab.socklen());
     const too_long = try Address.init("@" ++ ("x" ** 200));
     try testing.expectError(error.NameTooLong, too_long.socklen());
+}
+
+test "unix:// is served on Unix and refused on Windows" {
+    // The platform split above is the whole point of `supported`: the same
+    // call must bind a socket here and return `error.Unsupported` on Windows,
+    // instead of silently falling back to something that half-works.
+    const addr = try Address.init("/tmp/ygg-unix-platform-test.sock");
+    if (comptime supported) {
+        cleanupStale(addr);
+        const server = try listener(addr, 4);
+        defer {
+            _ = std.posix.system.close(server.fd);
+            cleanupStale(addr);
+        }
+        const client = try dial(addr);
+        defer _ = std.posix.system.close(client.fd);
+    } else {
+        try std.testing.expectError(error.Unsupported, listener(addr, 4));
+        try std.testing.expectError(error.Unsupported, dial(addr));
+        // Nothing is written to disk on such a target either.
+        cleanupStale(addr);
+    }
 }

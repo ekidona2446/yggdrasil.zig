@@ -11,7 +11,6 @@ pub const firewall = @import("firewall.zig");
 pub const ipv6rwc = @import("ipv6rwc.zig");
 pub const admin = @import("admin.zig");
 pub const admin_server = @import("admin_server.zig");
-pub const tls = @import("tls.zig");
 pub const tls_wolfssl = @import("tls_wolfssl.zig");
 pub const ws = @import("ws.zig");
 pub const quic = @import("quic.zig");
@@ -22,6 +21,7 @@ pub const tun = @import("tun.zig");
 pub const dns = @import("dns.zig");
 pub const network = @import("network.zig");
 pub const unix_socket = @import("unix_socket.zig");
+pub const socks = @import("socks.zig");
 
 pub const Address = address.Address;
 pub const Subnet = address.Subnet;
@@ -41,7 +41,6 @@ test {
     _ = ipv6rwc;
     _ = admin;
     _ = admin_server;
-    _ = tls;
     _ = tls_wolfssl;
     _ = multicast;
     _ = ckr;
