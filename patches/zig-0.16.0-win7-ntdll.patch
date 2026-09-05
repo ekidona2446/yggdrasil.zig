@@ -1,0 +1,368 @@
+--- a/std/os/windows/ntdll.zig
++++ b/std/os/windows/ntdll.zig
+@@ -624,11 +624,332 @@
+     OldAccessProtection: *PAGE,
+ ) callconv(.winapi) NTSTATUS;
+ 
+-pub extern "ntdll" fn NtWaitForAlertByThreadId(
++// ═══════════════════════════════════════════════════════════════════════════
++//  Windows Vista / 7 compatibility for the three Windows 8+ imports below
++// ═══════════════════════════════════════════════════════════════════════════
++//
++// `NtWaitForAlertByThreadId`, `NtAlertThreadByThreadId` and
++// `RtlGetSystemTimePrecise` were introduced in Windows 8 / Server 2012.
++// Declaring them `extern` emits static imports, and Windows refuses to start a
++// process (or `LoadLibrary` a DLL) whose imports cannot be resolved:
++//
++//     The procedure entry point NtWaitForAlertByThreadId could not be located
++//     in the dynamic link library ntdll.dll
++//
++// so all three are resolved at runtime instead. Windows 8 and newer keep
++// calling the native implementation through a cached function pointer (no
++// measurable difference); Windows Vista, 7, Server 2008 and 2008 R2 fall back
++// to equivalents built from APIs that exist since Win2k:
++//
++//   RtlGetSystemTimePrecise   -> QueryPerformanceCounter +
++//                                GetSystemTimeAsFileTime hybrid clock
++//   NtWaitForAlertByThreadId  -> WaitForSingleObject on a per-thread
++//   NtAlertThreadByThreadId   -> SetEvent on that thread's event
++//                                (auto-reset event object)
++
++/// Per-thread auto-reset event used by the Windows 7 parking fallback.
++/// (`threadlocal` is only allowed at container scope.)
++threadlocal var win7_alert_event: ?HANDLE = null;
++threadlocal var win7_alert_registered: bool = false;
++
++const win7 = struct {
++    extern "kernel32" fn GetModuleHandleW(lpModuleName: [*:0]const u16) callconv(.winapi) ?*anyopaque;
++    extern "kernel32" fn GetProcAddress(hModule: ?*anyopaque, lpProcName: [*:0]const u8) callconv(.winapi) ?*anyopaque;
++    extern "kernel32" fn QueryPerformanceCounter(lpPerformanceCount: *i64) callconv(.winapi) i32;
++    extern "kernel32" fn QueryPerformanceFrequency(lpFrequency: *i64) callconv(.winapi) i32;
++    extern "kernel32" fn GetSystemTimeAsFileTime(lpSystemTimeAsFileTime: *u64) callconv(.winapi) void;
++    extern "kernel32" fn CreateEventW(
++        lpEventAttributes: ?*const anyopaque,
++        bManualReset: i32,
++        bInitialState: i32,
++        lpName: ?[*:0]const u16,
++    ) callconv(.winapi) ?HANDLE;
++    extern "kernel32" fn SetEvent(hEvent: HANDLE) callconv(.winapi) i32;
++    extern "kernel32" fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: u32) callconv(.winapi) u32;
++    extern "kernel32" fn GetCurrentThreadId() callconv(.winapi) DWORD;
++
++    const WAIT_TIMEOUT: u32 = 0x00000102;
++    const INFINITE: u32 = 0xFFFFFFFF;
++
++    const kernel32_dll = std.unicode.utf8ToUtf16LeStringLiteral("kernel32.dll");
++    const ntdll_dll = std.unicode.utf8ToUtf16LeStringLiteral("ntdll.dll");
++
++    fn lookup(comptime module: [:0]const u16, comptime name: [:0]const u8) ?*anyopaque {
++        const h = GetModuleHandleW(module) orelse return null;
++        return GetProcAddress(h, name);
++    }
++
++    // ── Hybrid wall clock, replacing `RtlGetSystemTimePrecise` ─────────────
++    //
++    // `GetSystemTimeAsFileTime` alone is only refreshed on the system tick
++    // (~15.6 ms) which is far too coarse for an `Io.Timestamp`; QPC is a
++    // monotonic counter with sub-microsecond resolution but is not a wall
++    // clock. Combining them gives both:
++    //
++    //     now = FILETIME_anchor + (QPC_now - QPC_anchor) * 10^7 / QPC_freq
++    //
++    // Every 15 s the anchor is validated against `GetSystemTimeAsFileTime`.
++    // Offsets below 100 ms are removed by slewing the assumed QPC frequency,
++    // so the clock stays monotonic and continuous; larger offsets mean the
++    // wall clock was stepped (NTP correction, manual change, resume from
++    // suspend) and are adopted immediately. The QPC rate itself is measured
++    // against the system clock and smoothed, so crystal drift is compensated
++    // instead of accumulating.
++    const CHECK_100NS: i64 = 150_000_000; // 15 s
++    const MAX_SLEW_100NS: i64 = 1_000_000; // 100 ms
++    const DEAD_ZONE_100NS: i64 = 200_000; // 20 ms, above the 15.6 ms tick noise
++    const MAX_CORRECTION_PPM: i64 = 10_000; // +/-1 %
++
++    var clock_state: std.atomic.Value(u8) = .init(0); // 0 uninit, 1 busy, 2 ready
++    var clock_lock: std.atomic.Value(u8) = .init(0);
++    var precise: ?*const fn () callconv(.winapi) i64 = null;
++    var anchor_ft: std.atomic.Value(i64) = .init(0);
++    var anchor_qpc: std.atomic.Value(i64) = .init(0);
++    var last_check_ft: std.atomic.Value(i64) = .init(0);
++    var last_sys_ft: std.atomic.Value(i64) = .init(0);
++    var eff_freq: std.atomic.Value(i64) = .init(1);
++    var qpc_freq: i64 = 1;
++
++    fn spinLock() void {
++        while (clock_lock.swap(1, .acquire) != 0) std.atomic.spinLoopHint();
++    }
++    fn spinUnlock() void {
++        clock_lock.store(0, .release);
++    }
++
++    fn clockInit() void {
++        var s = clock_state.load(.acquire);
++        while (true) {
++            switch (s) {
++                0 => {
++                    if (clock_state.cmpxchgWeak(0, 1, .acquire, .monotonic)) |observed| {
++                        s = observed;
++                        continue;
++                    }
++                    break;
++                },
++                1 => {
++                    std.atomic.spinLoopHint();
++                    s = clock_state.load(.acquire);
++                },
++                else => return,
++            }
++        }
++        if (lookup(ntdll_dll, "RtlGetSystemTimePrecise")) |proc| {
++            precise = @as(*const fn () callconv(.winapi) i64, @ptrCast(proc));
++        }
++        var freq: i64 = 0;
++        qpc_freq = if (QueryPerformanceFrequency(&freq) != 0 and freq > 0) freq else 1;
++        reanchor();
++        clock_state.store(2, .release);
++    }
++
++    fn reanchor() void {
++        var raw: u64 = 0;
++        GetSystemTimeAsFileTime(&raw);
++        var qpc: i64 = 0;
++        _ = QueryPerformanceCounter(&qpc);
++        const ft: i64 = @bitCast(raw);
++        anchor_ft.store(ft, .release);
++        anchor_qpc.store(qpc, .release);
++        last_check_ft.store(ft, .release);
++        last_sys_ft.store(ft, .release);
++        eff_freq.store(qpc_freq, .release);
++    }
++
++    /// FILETIME (100 ns since 1601-01-01) as a signed integer, high resolution
++    /// in every Windows version from Win2k onwards.
++    fn filetime() i64 {
++        clockInit();
++        if (precise) |f| return f();
++
++        var qpc: i64 = 0;
++        if (QueryPerformanceCounter(&qpc) == 0) {
++            var raw: u64 = 0;
++            GetSystemTimeAsFileTime(&raw);
++            return @bitCast(raw);
++        }
++        const ft = anchor_ft.load(.monotonic) +
++            @divTrunc((qpc - anchor_qpc.load(.monotonic)) * 10_000_000, eff_freq.load(.monotonic));
++
++        // Unsigned wrap: a backwards jump of the sampled value also triggers the check.
++        if (ft -% last_check_ft.load(.monotonic) < CHECK_100NS) return ft;
++
++        spinLock();
++        defer spinUnlock();
++        if (ft -% last_check_ft.load(.monotonic) < CHECK_100NS) return ft;
++
++        var raw: u64 = 0;
++        GetSystemTimeAsFileTime(&raw);
++        var now_qpc: i64 = 0;
++        _ = QueryPerformanceCounter(&now_qpc);
++        const sys_ft: i64 = @bitCast(raw);
++        const diff = ft - sys_ft;
++
++        if (diff > MAX_SLEW_100NS or diff < -MAX_SLEW_100NS) {
++            // Wall clock stepped or machine resumed from suspend: adopt it.
++            anchor_ft.store(sys_ft, .release);
++            anchor_qpc.store(now_qpc, .release);
++            last_check_ft.store(sys_ft, .release);
++            last_sys_ft.store(sys_ft, .release);
++            eff_freq.store(qpc_freq, .release);
++            return sys_ft;
++        }
++
++        const d_qpc = now_qpc - anchor_qpc.load(.monotonic);
++        const d_sys = sys_ft - last_sys_ft.load(.monotonic);
++        if (d_qpc > 0 and d_sys > 0) {
++            // Unbiased rate measurement, exponentially smoothed; the 15.6 ms
++            // quantisation noise does not accumulate because each sample is
++            // independent.
++            var f = @divTrunc(d_qpc * 10_000_000, d_sys);
++            const cur = eff_freq.load(.monotonic);
++            f = cur + @divTrunc(f - cur, 8);
++            // Slow proportional damping of the residual offset (K = 1/64),
++            // small enough that the loop cannot oscillate.
++            if (diff > DEAD_ZONE_100NS or diff < -DEAD_ZONE_100NS) {
++                f += @divTrunc(@divTrunc(f * diff, d_sys), 64);
++            }
++            const min_f = @divTrunc(qpc_freq * (1_000_000 - MAX_CORRECTION_PPM), 1_000_000);
++            const max_f = @divTrunc(qpc_freq * (1_000_000 + MAX_CORRECTION_PPM), 1_000_000);
++            eff_freq.store(@min(max_f, @max(min_f, f)), .release);
++        }
++
++        // Re-anchor on the value being returned: the clock never jumps and
++        // never pauses, only its rate is corrected.
++        anchor_ft.store(ft, .release);
++        anchor_qpc.store(now_qpc, .release);
++        last_check_ft.store(ft, .release);
++        last_sys_ft.store(sys_ft, .release);
++        return ft;
++    }
++
++    // ── Thread parking fallback ───────────────────────────────────────────
++    //
++    // Windows 8 parks a thread with `NtWaitForAlertByThreadId` and wakes it
++    // with `NtAlertThreadByThreadId(tid)`. On older systems every thread gets
++    // one auto-reset event object: an auto-reset event stays signalled until
++    // a wait consumes it, which provides exactly the "unpark before park wins"
++    // semantics the caller depends on.
++    const MAX_SLOTS: usize = 1024;
++    const Slot = struct { tid: DWORD, handle: ?HANDLE };
++    var slots: [MAX_SLOTS]Slot = @splat(.{ .tid = 0, .handle = null });
++    var slot_used: usize = 0;
++    var slot_next: usize = 0;
++    var slot_lock: std.atomic.Value(u8) = .init(0);
++
++    fn slotSpinLock() void {
++        while (slot_lock.swap(1, .acquire) != 0) std.atomic.spinLoopHint();
++    }
++    fn slotSpinUnlock() void {
++        slot_lock.store(0, .release);
++    }
++
++    fn registerThread(tid: DWORD, handle: HANDLE) void {
++        slotSpinLock();
++        defer slotSpinUnlock();
++        for (slots[0..slot_used]) |*s| {
++            if (s.tid == tid) {
++                s.handle = handle;
++                return;
++            }
++        }
++        if (slot_used < MAX_SLOTS) {
++            slots[slot_used] = .{ .tid = tid, .handle = handle };
++            slot_used += 1;
++            return;
++        }
++        // Table full: replace round-robin. With 1024 slots this only happens
++        // if the process has created (and leaked) that many parked threads.
++        const idx = slot_next;
++        slot_next = (slot_next + 1) % MAX_SLOTS;
++        slots[idx] = .{ .tid = tid, .handle = handle };
++    }
++
++    fn wakeThread(tid: DWORD) void {
++        slotSpinLock();
++        defer slotSpinUnlock();
++        for (slots[0..slot_used]) |s| {
++            if (s.tid == tid) {
++                if (s.handle) |h| _ = SetEvent(h);
++                return;
++            }
++        }
++    }
++
++    /// `Timeout` is a Windows interval: negative for a relative duration,
++    /// positive for an absolute deadline, `null` for infinite.
++    fn parkFallback(Timeout: ?*const LARGE_INTEGER) NTSTATUS {
++        const handle = win7_alert_event orelse blk: {
++            const h = CreateEventW(null, 0, 0, null) orelse return .TIMEOUT;
++            win7_alert_event = h;
++            break :blk h;
++        };
++        if (!win7_alert_registered) {
++            registerThread(GetCurrentThreadId(), handle);
++            win7_alert_registered = true;
++        }
++        const ms: u32 = ms: {
++            const v = (Timeout orelse break :ms INFINITE).*;
++            if (v < 0) {
++                // Relative duration in 100 ns units, round up.
++                break :ms @intCast(@min(@divTrunc(-v + 9_999, 10_000), @as(i64, INFINITE - 1)));
++            }
++            // Absolute deadline in 100 ns since 1601; round the remaining time up.
++            const remaining = v - filetime();
++            if (remaining <= 0) break :ms 0;
++            break :ms @intCast(@min(@divTrunc(remaining + 9_999, 10_000), @as(i64, INFINITE - 1)));
++        };
++        return if (WaitForSingleObject(handle, ms) == WAIT_TIMEOUT) .TIMEOUT else .ALERTED;
++    }
++};
++
++pub fn NtWaitForAlertByThreadId(
+     Address: ?*const anyopaque,
+     Timeout: ?*const LARGE_INTEGER,
+-) callconv(.winapi) NTSTATUS;
+-pub extern "ntdll" fn NtAlertThreadByThreadId(ThreadId: DWORD) callconv(.winapi) NTSTATUS;
++) callconv(.winapi) NTSTATUS {
++    // Resolved once; on Windows 8+ this is the native implementation.
++    const Impl = *const fn (?*const anyopaque, ?*const LARGE_INTEGER) callconv(.winapi) NTSTATUS;
++    const get = struct {
++        var cached: std.atomic.Value(?Impl) = .init(null);
++        var resolved: std.atomic.Value(bool) = .init(false);
++        fn impl() ?Impl {
++            if (resolved.load(.acquire)) return cached.load(.acquire);
++            const p = win7.lookup(win7.ntdll_dll, "NtWaitForAlertByThreadId") orelse blk: {
++                resolved.store(true, .release);
++                break :blk null;
++            };
++            const f: Impl = @ptrCast(p);
++            cached.store(f, .release);
++            resolved.store(true, .release);
++            return f;
++        }
++    }.impl;
++    if (get()) |f| return f(Address, Timeout);
++    return win7.parkFallback(Timeout);
++}
++
++pub fn NtAlertThreadByThreadId(ThreadId: DWORD) callconv(.winapi) NTSTATUS {
++    const Impl = *const fn (DWORD) callconv(.winapi) NTSTATUS;
++    const get = struct {
++        var cached: std.atomic.Value(?Impl) = .init(null);
++        var resolved: std.atomic.Value(bool) = .init(false);
++        fn impl() ?Impl {
++            if (resolved.load(.acquire)) return cached.load(.acquire);
++            const p = win7.lookup(win7.ntdll_dll, "NtAlertThreadByThreadId") orelse blk: {
++                resolved.store(true, .release);
++                break :blk null;
++            };
++            const f: Impl = @ptrCast(p);
++            cached.store(f, .release);
++            resolved.store(true, .release);
++            return f;
++        }
++    }.impl;
++    if (get()) |f| return f(ThreadId);
++    win7.wakeThread(ThreadId);
++    return .SUCCESS;
++}
+ pub extern "ntdll" fn NtAlertThread(ThreadHandle: HANDLE) callconv(.winapi) NTSTATUS;
+ pub extern "ntdll" fn NtAlertMultipleThreadByThreadId(
+     ThreadIds: [*]const ULONG_PTR,
+@@ -673,7 +994,28 @@
+     Buffer: [*]u16,
+ ) callconv(.winapi) ULONG;
+ 
+-pub extern "ntdll" fn RtlGetSystemTimePrecise() callconv(.winapi) LARGE_INTEGER;
++pub fn RtlGetSystemTimePrecise() callconv(.winapi) LARGE_INTEGER {
++    // `LARGE_INTEGER` is `i64`. On Windows 8+ this resolves to the native
++    // implementation; on Windows 7 and older it is the QPC + system-time
++    // hybrid clock from `win7.filetime()`.
++    const Impl = *const fn () callconv(.winapi) i64;
++    const get = struct {
++        var cached: std.atomic.Value(?Impl) = .init(null);
++        var resolved: std.atomic.Value(bool) = .init(false);
++        fn impl() ?Impl {
++            if (resolved.load(.acquire)) return cached.load(.acquire);
++            const p = win7.lookup(win7.ntdll_dll, "RtlGetSystemTimePrecise") orelse blk: {
++                resolved.store(true, .release);
++                break :blk null;
++            };
++            const f: Impl = @ptrCast(p);
++            cached.store(f, .release);
++            resolved.store(true, .release);
++            return f;
++        }
++    }.impl;
++    return if (get()) |f| f() else win7.filetime();
++}
+ 
+ pub extern "ntdll" fn RtlInitializeCriticalSection(
+     lpCriticalSection: *CRITICAL_SECTION,
