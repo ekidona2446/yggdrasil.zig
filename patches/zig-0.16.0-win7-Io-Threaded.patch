@@ -1,0 +1,408 @@
+--- a/std/Io/Threaded.zig
++++ b/std/Io/Threaded.zig
+@@ -10762,8 +10762,114 @@
+     }
+ }
+ 
++// ═══════════════════════════════════════════════════════════════════════════
++//  Windows Vista / 7 console output compatibility
++// ═══════════════════════════════════════════════════════════════════════════
++//
++// Since Windows 8 a console handle is a real NT kernel handle referring to an
++// object created by the ConDrv driver, so `NtWriteFile` writes to the console
++// exactly like it writes to a file. On Windows Vista and 7 there is no ConDrv:
++// console handles are CSRSS pseudo handles, tagged by having their two low
++// bits set (0x3, 0x7, 0xB, ...). `NtWriteFile` rejects them with
++// STATUS_INVALID_HANDLE, which surfaces as `error.NotOpenForWriting` and makes
++// every console program silently produce no output.
++//
++// `WriteConsoleW` is the documented API for those handles and exists since
++// Win2k. It is only reachable through kernel32, and only used after
++// `NtWriteFile` has actually failed on a handle that looks like a pseudo
++// handle, so Windows 8+ never executes any of this and pays only for a
++// never-taken branch on the error path.
++/// Comptime-eliminated when the target already guarantees Windows 8, so
++/// modern builds keep the plain NtWriteFile path with no extra branch.
++const win7_console_fallback_needed = is_windows and
++    !builtin.os.version_range.windows.min.isAtLeast(.win8);
++
++const win7_console = struct {
++    extern "kernel32" fn WriteConsoleW(
++        hConsoleOutput: windows.HANDLE,
++        lpBuffer: [*]const u16,
++        nNumberOfCharsToWrite: windows.DWORD,
++        lpNumberOfCharsWritten: ?*windows.DWORD,
++        lpReserved: ?*anyopaque,
++    ) callconv(.winapi) windows.BOOL;
++
++    /// CSRSS pseudo handles have their low two bits set. Real kernel handles
++    /// are always a multiple of four, so this never misfires on Windows 8+.
++    fn isPseudoConsoleHandle(handle: windows.HANDLE) bool {
++        return @intFromPtr(handle) & 0x3 == 0x3;
++    }
++
++    /// Writes WTF-8 to a Vista/7 console handle. Returns the number of *bytes*
++    /// consumed so the caller can treat it like a normal short write.
++    fn write(handle: windows.HANDLE, buffer: []const u8) File.Writer.Error!usize {
++        // Translate in bounded chunks so that no allocation is required. The
++        // chunk boundary is moved back to a UTF-8 sequence boundary so a
++        // multi-byte codepoint is never split across two calls.
++        var utf16_buf: [4096]u16 = undefined;
++        var byte_len = @min(buffer.len, 2048);
++        while (byte_len > 1 and buffer[byte_len - 1] & 0xC0 == 0x80) byte_len -= 1;
++        if (byte_len < buffer.len and buffer[byte_len - 1] & 0x80 != 0 and
++            buffer[byte_len - 1] & 0xC0 != 0x80) byte_len -= 1;
++        if (byte_len == 0) byte_len = @min(buffer.len, 2048);
++
++        const utf16_len = std.unicode.wtf8ToWtf16Le(&utf16_buf, buffer[0..byte_len]) catch
++            return error.Unexpected;
++        if (utf16_len == 0) return byte_len;
++
++        var written: windows.DWORD = 0;
++        if (!WriteConsoleW(handle, &utf16_buf, @intCast(utf16_len), &written, null).toBool())
++            return error.Unexpected;
++        if (written == utf16_len) return byte_len;
++
++        // Partial write: report the number of bytes matching the UTF-16 units
++        // that were accepted, re-encoding to find the split point.
++        var bytes: usize = 0;
++        var units: usize = 0;
++        var it: std.unicode.Wtf8Iterator = .{ .bytes = buffer[0..byte_len], .i = 0 };
++        while (it.nextCodepointSlice()) |slice| {
++            const cp_units: usize = if (slice.len == 4) 2 else 1;
++            if (units + cp_units > written) break;
++            units += cp_units;
++            bytes += slice.len;
++        }
++        return if (bytes == 0) error.Unexpected else bytes;
++    }
++};
++
++/// Entropy fallback for systems without an accessible `\Device\CNG`.
++///
++/// `Io.Threaded.randomSecure` talks to the CNG device directly, which is the
++/// right call on Windows 8+. On Vista/7 the device exists but is not always
++/// reachable (and Wine does not implement it at all), in which case the
++/// documented user-mode entropy source is `RtlGenRandom`, exported by
++/// advapi32 under its ordinal name `SystemFunction036` since Windows XP.
++///
++/// Only reached after the CNG path has actually failed, so Windows 8+ never
++/// loads advapi32 because of this.
++const win7_random = struct {
++    extern "advapi32" fn SystemFunction036(
++        RandomBuffer: [*]u8,
++        RandomBufferLength: windows.ULONG,
++    ) callconv(.winapi) windows.BOOLEAN;
++
++    fn fill(buffer: []u8) bool {
++        var i: usize = 0;
++        while (i < buffer.len) {
++            // The API takes a ULONG length; chunk for very large requests.
++            const chunk = std.math.lossyCast(windows.ULONG, @min(buffer.len - i, 0xFFFF_FFFF));
++            if (!SystemFunction036(buffer[i..].ptr, chunk).toBool()) return false;
++            i += chunk;
++        }
++        return true;
++    }
++};
++
+ fn fileWriteStreamingWindows(file: File, buffer: []const u8) File.Writer.Error!usize {
+     assert(buffer.len != 0);
++    // Vista/7: console handles are not writable via NtWriteFile. Checked
++    // before the syscall because the handle tag is unambiguous.
++    if (win7_console_fallback_needed and win7_console.isPseudoConsoleHandle(file.handle))
++        return win7_console.write(file.handle, buffer);
+     var iosb: windows.IO_STATUS_BLOCK = undefined;
+     if (file.flags.nonblocking) {
+         var done: bool = false;
+@@ -12099,7 +12205,15 @@
+     const family = posixAddressFamily(address);
+     const socket_handle = try openSocketAfd(family, .{ .mode = options.mode, .protocol = options.protocol });
+     errdefer windows.CloseHandle(socket_handle);
+-    try setSocketOptionAfd(socket_handle, ws2_32.SOL.SOCKET, ws2_32.SO.REUSE_UNICASTPORT, true);
++    // SO_REUSE_UNICASTPORT (12295) only exists since Windows 10 1703. It is a
++    // port-exhaustion optimisation for outbound connections, not a
++    // correctness requirement, so older systems must not fail the whole
++    // connect when the transport rejects the option. Windows 10+ behaviour is
++    // unchanged: the option is still set, and only a rejection is tolerated.
++    setSocketOptionAfd(socket_handle, ws2_32.SOL.SOCKET, ws2_32.SO.REUSE_UNICASTPORT, true) catch |err| switch (err) {
++        error.Canceled => |e| return e,
++        else => {},
++    };
+     const bound_address = bindSocketIpAfd(socket_handle, &switch (address.*) {
+         .ip4 => .{ .ip4 = .unspecified(0) },
+         .ip6 => .{ .ip6 = .unspecified(0) },
+@@ -17017,7 +17131,15 @@
+         //   despite the function being documented to always return TRUE
+         // * reads from "\\Device\\CNG" which then seeds a per-CPU AES CSPRNG
+         // Therefore, that function is avoided in favor of using the device directly.
+-        const cng_device = try getCngDevice(t);
++        const cng_device = getCngDevice(t) catch |err| switch (err) {
++            // Vista/7 (or Wine) may not expose \Device\CNG; fall back to
++            // RtlGenRandom rather than failing outright.
++            error.EntropyUnavailable => {
++                if (win7_console_fallback_needed and win7_random.fill(buffer)) return;
++                return error.EntropyUnavailable;
++            },
++            else => |e| return e,
++        };
+         var io_status_block: windows.IO_STATUS_BLOCK = undefined;
+         var i: usize = 0;
+         const syscall: Syscall = try .start();
+@@ -17048,7 +17170,15 @@
+                     try syscall.checkCancel();
+                     continue;
+                 },
+-                else => return syscall.fail(error.EntropyUnavailable),
++                else => {
++                    // The device opened but rejected the ioctl (seen on some
++                    // pre-Win8 configurations): use the user-mode CSPRNG.
++                    if (win7_console_fallback_needed and win7_random.fill(buffer)) {
++                        syscall.finish();
++                        return;
++                    }
++                    return syscall.fail(error.EntropyUnavailable);
++                },
+             }
+         }
+     }
+@@ -18501,8 +18631,239 @@
+     }
+ }
+ 
++/// Windows Vista / 7 console backend.
++///
++/// Since Windows 8 the standard library talks to the console by sending
++/// `IOCTL_CONDRV_ISSUE_USER_IO` to the ConDrv driver, passing a serialised
++/// console API call. Windows Vista and 7 predate ConDrv entirely: the console
++/// lives in CSRSS and is only reachable through the kernel32 console API.
++///
++/// Rather than patching each of the ~12 call sites in `Io.Threaded` and
++/// `std.Progress`, the request is intercepted here, at the single choke point
++/// all of them funnel through, and translated back into the kernel32 call it
++/// was serialised from. The console handle is taken from the request payload
++/// (`Request.Handle`), not from the device handle, because the latter is the
++/// ConDrv connection which does not exist on these systems.
++///
++/// Comptime-eliminated unless the target may run on Vista/7.
++const win7_condrv = struct {
++    const CONSOLE_SCREEN_BUFFER_INFO = extern struct {
++        dwSize: windows.COORD,
++        dwCursorPosition: windows.COORD,
++        wAttributes: windows.WORD,
++        srWindow: extern struct { Left: windows.SHORT, Top: windows.SHORT, Right: windows.SHORT, Bottom: windows.SHORT },
++        dwMaximumWindowSize: windows.COORD,
++    };
++
++    extern "kernel32" fn GetConsoleMode(hConsoleHandle: windows.HANDLE, lpMode: *windows.DWORD) callconv(.winapi) windows.BOOL;
++    extern "kernel32" fn SetConsoleMode(hConsoleHandle: windows.HANDLE, dwMode: windows.DWORD) callconv(.winapi) windows.BOOL;
++    extern "kernel32" fn GetConsoleOutputCP() callconv(.winapi) windows.UINT;
++    extern "kernel32" fn GetConsoleCP() callconv(.winapi) windows.UINT;
++    extern "kernel32" fn GetConsoleScreenBufferInfo(
++        hConsoleOutput: windows.HANDLE,
++        lpConsoleScreenBufferInfo: *CONSOLE_SCREEN_BUFFER_INFO,
++    ) callconv(.winapi) windows.BOOL;
++    extern "kernel32" fn SetConsoleCursorPosition(
++        hConsoleOutput: windows.HANDLE,
++        dwCursorPosition: windows.COORD,
++    ) callconv(.winapi) windows.BOOL;
++    extern "kernel32" fn FillConsoleOutputCharacterW(
++        hConsoleOutput: windows.HANDLE,
++        cCharacter: windows.WCHAR,
++        nLength: windows.DWORD,
++        dwWriteCoord: windows.COORD,
++        lpNumberOfCharsWritten: *windows.DWORD,
++    ) callconv(.winapi) windows.BOOL;
++    extern "kernel32" fn FillConsoleOutputAttribute(
++        hConsoleOutput: windows.HANDLE,
++        wAttribute: windows.WORD,
++        nLength: windows.DWORD,
++        dwWriteCoord: windows.COORD,
++        lpNumberOfAttrsWritten: *windows.DWORD,
++    ) callconv(.winapi) windows.BOOL;
++    extern "kernel32" fn ReadConsoleOutputCharacterW(
++        hConsoleOutput: windows.HANDLE,
++        lpCharacter: [*]u16,
++        nLength: windows.DWORD,
++        dwReadCoord: windows.COORD,
++        lpNumberOfCharsRead: *windows.DWORD,
++    ) callconv(.winapi) windows.BOOL;
++    extern "kernel32" fn SetConsoleTextAttribute(
++        hConsoleOutput: windows.HANDLE,
++        wAttributes: windows.WORD,
++    ) callconv(.winapi) windows.BOOL;
++    extern "kernel32" fn WriteConsoleW(
++        hConsoleOutput: windows.HANDLE,
++        lpBuffer: *const anyopaque,
++        nNumberOfCharsToWrite: windows.DWORD,
++        lpNumberOfCharsWritten: ?*windows.DWORD,
++        lpReserved: ?*anyopaque,
++    ) callconv(.winapi) windows.BOOL;
++
++    /// Layout of the serialised request; mirrors `CONSOLE.USER_IO.Request`
++    /// with the buffer counts left dynamic.
++    const RequestHeader = extern struct {
++        Handle: ?windows.HANDLE,
++        InputBuffersLength: u32,
++        OutputBuffersLength: u32,
++    };
++    const Buffer = extern struct { Size: u32, Pointer: usize };
++
++    /// The `Header` prefix each payload carries: operation code plus size.
++    const OpHeader = extern struct { Operation: windows.CONSOLE.USER_IO.Operation, Size: u32 };
++
++    fn buffers(req: [*]const u8, count: u32, offset: usize) []const Buffer {
++        const base: [*]const Buffer = @alignCast(@ptrCast(req + offset));
++        return base[0..count];
++    }
++
++    /// Translates one CONDRV request. Returns the NTSTATUS to report, or null
++    /// if the operation is not one the fallback implements (the caller then
++    /// lets the real ioctl run and fail as it would have anyway).
++    fn dispatch(in: []const u8) ?windows.NTSTATUS {
++        if (in.len < @sizeOf(RequestHeader)) return null;
++        const req: *const RequestHeader = @alignCast(@ptrCast(in.ptr));
++        const handle = req.Handle orelse return .INVALID_HANDLE;
++
++        const in_bufs = buffers(in.ptr, req.InputBuffersLength, @sizeOf(RequestHeader));
++        if (in_bufs.len == 0) return null;
++        const out_bufs = buffers(
++            in.ptr,
++            req.OutputBuffersLength,
++            @sizeOf(RequestHeader) + in_bufs.len * @sizeOf(Buffer),
++        );
++
++        // The first input buffer is the `Header.With(Data)` payload.
++        const payload: [*]u8 = @ptrFromInt(in_bufs[0].Pointer);
++        const op_header: *const OpHeader = @alignCast(@ptrCast(payload));
++        const data: [*]u8 = payload + @sizeOf(OpHeader);
++
++        switch (op_header.Operation) {
++            .GetMode => {
++                const mode: *windows.DWORD = @alignCast(@ptrCast(data));
++                return if (GetConsoleMode(handle, mode).toBool()) .SUCCESS else .INVALID_HANDLE;
++            },
++            .SetMode => {
++                const mode: *const windows.DWORD = @alignCast(@ptrCast(data));
++                return if (SetConsoleMode(handle, mode.*).toBool()) .SUCCESS else .INVALID_HANDLE;
++            },
++            .GetCP => {
++                const info: *windows.CONSOLE.USER_IO.INFO.CP = @alignCast(@ptrCast(data));
++                info.CodePage = switch (info.Mode) {
++                    .Input => GetConsoleCP(),
++                    .Output => GetConsoleOutputCP(),
++                };
++                return if (info.CodePage != 0) .SUCCESS else .INVALID_HANDLE;
++            },
++            .GetScreenBufferInfo => {
++                const info: *windows.CONSOLE.USER_IO.INFO.SCREEN_BUFFER = @alignCast(@ptrCast(data));
++                var raw: CONSOLE_SCREEN_BUFFER_INFO = undefined;
++                if (!GetConsoleScreenBufferInfo(handle, &raw).toBool()) return .INVALID_HANDLE;
++                info.* = .{
++                    .dwSize = raw.dwSize,
++                    .dwCursorPosition = raw.dwCursorPosition,
++                    .dwWindowPosition = .{ .X = raw.srWindow.Left, .Y = raw.srWindow.Top },
++                    .wAttributes = raw.wAttributes,
++                    .dwWindowSize = .{
++                        .X = raw.srWindow.Right - raw.srWindow.Left + 1,
++                        .Y = raw.srWindow.Bottom - raw.srWindow.Top + 1,
++                    },
++                    .dwMaximumWindowSize = raw.dwMaximumWindowSize,
++                    .wPopupAttributes = 0,
++                    .bFullscreenSupported = .FALSE,
++                    .ColorTable = @splat(0),
++                };
++                return .SUCCESS;
++            },
++            .SetCursorPosition => {
++                const coord: *const windows.COORD = @alignCast(@ptrCast(data));
++                return if (SetConsoleCursorPosition(handle, coord.*).toBool()) .SUCCESS else .INVALID_HANDLE;
++            },
++            .SetTextAttribute => {
++                const attr: *const windows.WORD = @alignCast(@ptrCast(data));
++                return if (SetConsoleTextAttribute(handle, attr.*).toBool()) .SUCCESS else .INVALID_HANDLE;
++            },
++            .Fill => {
++                const info: *windows.CONSOLE.USER_IO.INFO.FILL = @alignCast(@ptrCast(data));
++                var written: windows.DWORD = 0;
++                const ok = switch (info.Tag) {
++                    .WideCharacter => FillConsoleOutputCharacterW(
++                        handle,
++                        info.With.WideCharacter,
++                        info.nLength,
++                        info.dwWriteCoord,
++                        &written,
++                    ),
++                    .Character => FillConsoleOutputCharacterW(
++                        handle,
++                        info.With.Character,
++                        info.nLength,
++                        info.dwWriteCoord,
++                        &written,
++                    ),
++                    .Attribute => FillConsoleOutputAttribute(
++                        handle,
++                        info.With.Attribute,
++                        info.nLength,
++                        info.dwWriteCoord,
++                        &written,
++                    ),
++                };
++                if (!ok.toBool()) return .INVALID_HANDLE;
++                info.nLength = written;
++                return .SUCCESS;
++            },
++            .ReadOutputCharacter => {
++                const info: *windows.CONSOLE.USER_IO.INFO.READ_OUTPUT_CHARACTER = @alignCast(@ptrCast(data));
++                if (out_bufs.len == 0) return .INVALID_PARAMETER;
++                // The character buffer is the last output buffer; the first
++                // one aliases `Data` itself.
++                const chars_buf = out_bufs[out_bufs.len - 1];
++                const chars: [*]u16 = @ptrFromInt(chars_buf.Pointer);
++                var read: windows.DWORD = 0;
++                if (!ReadConsoleOutputCharacterW(
++                    handle,
++                    chars,
++                    chars_buf.Size / @sizeOf(u16),
++                    info.dwReadCoord,
++                    &read,
++                ).toBool()) return .INVALID_HANDLE;
++                info.nLength = read;
++                return .SUCCESS;
++            },
++            .Write => {
++                const info: *windows.CONSOLE.USER_IO.INFO.WRITE = @alignCast(@ptrCast(data));
++                if (in_bufs.len < 2) return .INVALID_PARAMETER;
++                const text = in_bufs[in_bufs.len - 1];
++                const ptr: [*]const u8 = @ptrFromInt(text.Pointer);
++                var written: windows.DWORD = 0;
++                const count: windows.DWORD = switch (info.Mode) {
++                    .WideCharacter => text.Size / @sizeOf(u16),
++                    .Character => text.Size,
++                };
++                if (!WriteConsoleW(handle, ptr, count, &written, null).toBool())
++                    return .INVALID_HANDLE;
++                info.Size = switch (info.Mode) {
++                    .WideCharacter => written * @sizeOf(u16),
++                    .Character => written,
++                };
++                return .SUCCESS;
++            },
++            else => return null,
++        }
++    }
++};
++
+ fn deviceIoControl(o: *const Io.Operation.DeviceIoControl) Io.Cancelable!Io.Operation.DeviceIoControl.Result {
+     if (is_windows) {
++        // Vista/7 have no ConDrv driver; serve console ioctls from kernel32.
++        if (win7_console_fallback_needed and
++            o.code.DeviceType == .CONSOLE and o.in.len != 0)
++        {
++            if (win7_condrv.dispatch(o.in)) |status| {
++                return .{ .u = .{ .Status = status }, .Information = 0 };
++            }
++        }
+         const NtControlFile = switch (o.code.DeviceType) {
+             .FILE_SYSTEM, .NAMED_PIPE => &windows.ntdll.NtFsControlFile,
+             else => &windows.ntdll.NtDeviceIoControlFile,

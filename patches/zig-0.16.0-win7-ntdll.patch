@@ -1,6 +1,120 @@
 --- a/std/os/windows/ntdll.zig
 +++ b/std/os/windows/ntdll.zig
-@@ -624,11 +624,332 @@
+@@ -1,4 +1,5 @@
+ const std = @import("../../std.zig");
++const builtin = @import("builtin");
+ const windows = std.os.windows;
+ 
+ const ACCESS_MASK = windows.ACCESS_MASK;
+@@ -524,7 +525,11 @@
+     DelayInterval: *const LARGE_INTEGER,
+ ) callconv(.winapi) NTSTATUS;
+ 
+-pub extern "ntdll" fn NtNotifyChangeDirectoryFileEx(
++/// The pre-Windows 10 directory change API, present since NT 3.1. Identical to
++/// `NtNotifyChangeDirectoryFileEx` except that it has no information-class
++/// parameter and always reports `FILE_NOTIFY_INFORMATION`, which is exactly
++/// what the `.Notify` class of the Ex variant returns.
++pub extern "ntdll" fn NtNotifyChangeDirectoryFile(
+     FileHandle: HANDLE,
+     Event: ?HANDLE,
+     ApcRoutine: ?*align(2) const IO_APC_ROUTINE,
+@@ -534,9 +539,93 @@
+     Length: ULONG,
+     CompletionFilter: FILE.NOTIFY.CHANGE,
+     WatchTree: BOOLEAN,
+-    DirectoryNotifyInformationClass: DIRECTORY.NOTIFY_INFORMATION_CLASS,
+ ) callconv(.winapi) NTSTATUS;
+ 
++pub const NtNotifyChangeDirectoryFileEx = if (win7_fallback_needed)
++    win7NtNotifyChangeDirectoryFileEx
++else
++    win7_native.NtNotifyChangeDirectoryFileEx;
++
++/// `NtNotifyChangeDirectoryFileEx` is Windows 10 1709 or newer; it is used by
++/// `std.Build.Watch` (`zig build --watch`). On older systems it is emulated
++/// with `NtNotifyChangeDirectoryFile`, which has existed since NT 3.1.
++///
++/// The only functional difference is the information class:
++///
++///   * `.Notify` asks for `FILE_NOTIFY_INFORMATION`, which is precisely what
++///     the old API always produces, so the fallback is exact.
++///   * `.NotifyExtended` and `.NotifyFull` ask for record types the old API
++///     cannot produce. Silently returning the smaller record would make the
++///     caller misparse the buffer, so those report `INVALID_PARAMETER`
++///     instead. `std.Build.Watch` only ever requests `.Notify`.
++fn win7NtNotifyChangeDirectoryFileEx(
++    FileHandle: HANDLE,
++    Event: ?HANDLE,
++    ApcRoutine: ?*align(2) const IO_APC_ROUTINE,
++    ApcContext: ?*anyopaque,
++    IoStatusBlock: *IO_STATUS_BLOCK,
++    Buffer: *anyopaque,
++    Length: ULONG,
++    CompletionFilter: FILE.NOTIFY.CHANGE,
++    WatchTree: BOOLEAN,
++    DirectoryNotifyInformationClass: DIRECTORY.NOTIFY_INFORMATION_CLASS,
++) callconv(.winapi) NTSTATUS {
++    const Impl = *const fn (
++        HANDLE,
++        ?HANDLE,
++        ?*align(2) const IO_APC_ROUTINE,
++        ?*anyopaque,
++        *IO_STATUS_BLOCK,
++        *anyopaque,
++        ULONG,
++        FILE.NOTIFY.CHANGE,
++        BOOLEAN,
++        DIRECTORY.NOTIFY_INFORMATION_CLASS,
++    ) callconv(.winapi) NTSTATUS;
++    const get = struct {
++        var cached: std.atomic.Value(?Impl) = .init(null);
++        var resolved: std.atomic.Value(bool) = .init(false);
++        fn impl() ?Impl {
++            if (resolved.load(.acquire)) return cached.load(.acquire);
++            const p = win7.lookup(win7.ntdll_dll, "NtNotifyChangeDirectoryFileEx") orelse {
++                resolved.store(true, .release);
++                return null;
++            };
++            const f: Impl = @ptrCast(p);
++            cached.store(f, .release);
++            resolved.store(true, .release);
++            return f;
++        }
++    }.impl;
++
++    if (get()) |f| return f(
++        FileHandle,
++        Event,
++        ApcRoutine,
++        ApcContext,
++        IoStatusBlock,
++        Buffer,
++        Length,
++        CompletionFilter,
++        WatchTree,
++        DirectoryNotifyInformationClass,
++    );
++
++    if (DirectoryNotifyInformationClass != .Notify) return .INVALID_PARAMETER;
++
++    return NtNotifyChangeDirectoryFile(
++        FileHandle,
++        Event,
++        ApcRoutine,
++        ApcContext,
++        IoStatusBlock,
++        Buffer,
++        Length,
++        CompletionFilter,
++        WatchTree,
++    );
++}
++
+ pub extern "ntdll" fn NtOpenThread(
+     ThreadHandle: *HANDLE,
+     DesiredAccess: ACCESS_MASK,
+@@ -624,11 +713,454 @@
      OldAccessProtection: *PAGE,
  ) callconv(.winapi) NTSTATUS;
  
@@ -28,10 +142,39 @@
 +//   NtAlertThreadByThreadId   -> SetEvent on that thread's event
 +//                                (auto-reset event object)
 +
++/// Whether the Windows 8+ APIs below must be resolved at runtime. When the
++/// target's minimum OS version already guarantees Windows 8, the whole
++/// fallback is comptime-eliminated and the plain `extern` import is used, so
++/// modern builds are bit-for-bit identical to unpatched Zig.
++const win7_fallback_needed = !(builtin.os.tag == .windows and
++    builtin.os.version_range.windows.min.isAtLeast(.win8));
++
++/// Direct imports, used verbatim when the target already guarantees Windows 8.
++/// Declared in a nested namespace so the emitted symbol names stay correct.
++const win7_native = struct {
++    pub extern "ntdll" fn NtWaitForAlertByThreadId(
++        Address: ?*const anyopaque,
++        Timeout: ?*const LARGE_INTEGER,
++    ) callconv(.winapi) NTSTATUS;
++    pub extern "ntdll" fn NtAlertThreadByThreadId(ThreadId: DWORD) callconv(.winapi) NTSTATUS;
++    pub extern "ntdll" fn RtlGetSystemTimePrecise() callconv(.winapi) LARGE_INTEGER;
++    pub extern "ntdll" fn NtNotifyChangeDirectoryFileEx(
++        FileHandle: HANDLE,
++        Event: ?HANDLE,
++        ApcRoutine: ?*align(2) const IO_APC_ROUTINE,
++        ApcContext: ?*anyopaque,
++        IoStatusBlock: *IO_STATUS_BLOCK,
++        Buffer: *anyopaque,
++        Length: ULONG,
++        CompletionFilter: FILE.NOTIFY.CHANGE,
++        WatchTree: BOOLEAN,
++        DirectoryNotifyInformationClass: DIRECTORY.NOTIFY_INFORMATION_CLASS,
++    ) callconv(.winapi) NTSTATUS;
++};
++
 +/// Per-thread auto-reset event used by the Windows 7 parking fallback.
 +/// (`threadlocal` is only allowed at container scope.)
 +threadlocal var win7_alert_event: ?HANDLE = null;
-+threadlocal var win7_alert_registered: bool = false;
 +
 +const win7 = struct {
 +    extern "kernel32" fn GetModuleHandleW(lpModuleName: [*:0]const u16) callconv(.winapi) ?*anyopaque;
@@ -47,9 +190,22 @@
 +    ) callconv(.winapi) ?HANDLE;
 +    extern "kernel32" fn SetEvent(hEvent: HANDLE) callconv(.winapi) i32;
 +    extern "kernel32" fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: u32) callconv(.winapi) u32;
++    /// Alertable variant. `NtWaitForAlertByThreadId` on Windows 8+ is an
++    /// alertable wait: a parked thread still receives queued APCs. Several
++    /// `Io.Threaded` operations (`accept`, and every other request issued with
++    /// `nonblocking = true`) depend on that, because they park the thread and
++    /// rely on an APC to signal completion. A plain `WaitForSingleObject`
++    /// never runs APCs, so those operations would block forever.
++    extern "kernel32" fn WaitForSingleObjectEx(
++        hHandle: HANDLE,
++        dwMilliseconds: u32,
++        bAlertable: i32,
++    ) callconv(.winapi) u32;
 +    extern "kernel32" fn GetCurrentThreadId() callconv(.winapi) DWORD;
 +
 +    const WAIT_TIMEOUT: u32 = 0x00000102;
++    /// Returned when the wait ended because an APC ran.
++    const WAIT_IO_COMPLETION: u32 = 0x000000C0;
 +    const INFINITE: u32 = 0xFFFFFFFF;
 +
 +    const kernel32_dll = std.unicode.utf8ToUtf16LeStringLiteral("kernel32.dll");
@@ -84,11 +240,47 @@
 +    var clock_state: std.atomic.Value(u8) = .init(0); // 0 uninit, 1 busy, 2 ready
 +    var clock_lock: std.atomic.Value(u8) = .init(0);
 +    var precise: ?*const fn () callconv(.winapi) i64 = null;
-+    var anchor_ft: std.atomic.Value(i64) = .init(0);
-+    var anchor_qpc: std.atomic.Value(i64) = .init(0);
-+    var last_check_ft: std.atomic.Value(i64) = .init(0);
-+    var last_sys_ft: std.atomic.Value(i64) = .init(0);
-+    var eff_freq: std.atomic.Value(i64) = .init(1);
++    /// 64-bit atomics do not exist on 32-bit x86, which is a supported
++    /// Windows 7 configuration, so the clock state is published through a
++    /// seqlock instead of five independent atomic words. That is in fact more
++    /// correct than the atomic version even on 64-bit: readers now observe the
++    /// whole anchor (`ft`, `qpc`, `freq`) as one consistent snapshot, and can
++    /// never mix a new `anchor_ft` with a stale `anchor_qpc`.
++    const Anchor = struct {
++        ft: i64 = 0,
++        qpc: i64 = 0,
++        check_ft: i64 = 0,
++        sys_ft: i64 = 0,
++        freq: i64 = 1,
++    };
++    var anchor: Anchor = .{};
++    /// Even = stable, odd = a writer is mid-update.
++    var anchor_seq: std.atomic.Value(u32) = .init(0);
++
++    fn anchorLoad() Anchor {
++        while (true) {
++            const s0 = anchor_seq.load(.acquire);
++            if (s0 & 1 != 0) {
++                std.atomic.spinLoopHint();
++                continue;
++            }
++            // `anchor` is only written between two `anchor_seq` bumps, and
++            // the sequence load below is `acquire`, so a torn read is always
++            // detected by the counter comparison.
++            const snapshot = anchor;
++            if (anchor_seq.load(.acquire) == s0) return snapshot;
++            std.atomic.spinLoopHint();
++        }
++    }
++
++    /// Callers must already hold `clock_lock` (or be in single-threaded init).
++    fn anchorStore(a: Anchor) void {
++        // Odd counter: readers retry while the payload is being written.
++        _ = anchor_seq.fetchAdd(1, .acq_rel);
++        anchor = a;
++        // Release: the payload write is visible before the counter turns even.
++        _ = anchor_seq.fetchAdd(1, .release);
++    }
 +    var qpc_freq: i64 = 1;
 +
 +    fn spinLock() void {
@@ -131,11 +323,7 @@
 +        var qpc: i64 = 0;
 +        _ = QueryPerformanceCounter(&qpc);
 +        const ft: i64 = @bitCast(raw);
-+        anchor_ft.store(ft, .release);
-+        anchor_qpc.store(qpc, .release);
-+        last_check_ft.store(ft, .release);
-+        last_sys_ft.store(ft, .release);
-+        eff_freq.store(qpc_freq, .release);
++        anchorStore(.{ .ft = ft, .qpc = qpc, .check_ft = ft, .sys_ft = ft, .freq = qpc_freq });
 +    }
 +
 +    /// FILETIME (100 ns since 1601-01-01) as a signed integer, high resolution
@@ -150,15 +338,17 @@
 +            GetSystemTimeAsFileTime(&raw);
 +            return @bitCast(raw);
 +        }
-+        const ft = anchor_ft.load(.monotonic) +
-+            @divTrunc((qpc - anchor_qpc.load(.monotonic)) * 10_000_000, eff_freq.load(.monotonic));
++        const snap = anchorLoad();
++        const ft = snap.ft + @divTrunc((qpc - snap.qpc) * 10_000_000, snap.freq);
 +
 +        // Unsigned wrap: a backwards jump of the sampled value also triggers the check.
-+        if (ft -% last_check_ft.load(.monotonic) < CHECK_100NS) return ft;
++        if (ft -% snap.check_ft < CHECK_100NS) return ft;
 +
 +        spinLock();
 +        defer spinUnlock();
-+        if (ft -% last_check_ft.load(.monotonic) < CHECK_100NS) return ft;
++        // Re-read under the lock: another thread may have just re-anchored.
++        const cur_snap = anchorLoad();
++        if (ft -% cur_snap.check_ft < CHECK_100NS) return ft;
 +
 +        var raw: u64 = 0;
 +        GetSystemTimeAsFileTime(&raw);
@@ -169,22 +359,25 @@
 +
 +        if (diff > MAX_SLEW_100NS or diff < -MAX_SLEW_100NS) {
 +            // Wall clock stepped or machine resumed from suspend: adopt it.
-+            anchor_ft.store(sys_ft, .release);
-+            anchor_qpc.store(now_qpc, .release);
-+            last_check_ft.store(sys_ft, .release);
-+            last_sys_ft.store(sys_ft, .release);
-+            eff_freq.store(qpc_freq, .release);
++            anchorStore(.{
++                .ft = sys_ft,
++                .qpc = now_qpc,
++                .check_ft = sys_ft,
++                .sys_ft = sys_ft,
++                .freq = qpc_freq,
++            });
 +            return sys_ft;
 +        }
 +
-+        const d_qpc = now_qpc - anchor_qpc.load(.monotonic);
-+        const d_sys = sys_ft - last_sys_ft.load(.monotonic);
++        var new_freq = cur_snap.freq;
++        const d_qpc = now_qpc - cur_snap.qpc;
++        const d_sys = sys_ft - cur_snap.sys_ft;
 +        if (d_qpc > 0 and d_sys > 0) {
 +            // Unbiased rate measurement, exponentially smoothed; the 15.6 ms
 +            // quantisation noise does not accumulate because each sample is
 +            // independent.
 +            var f = @divTrunc(d_qpc * 10_000_000, d_sys);
-+            const cur = eff_freq.load(.monotonic);
++            const cur = cur_snap.freq;
 +            f = cur + @divTrunc(f - cur, 8);
 +            // Slow proportional damping of the residual offset (K = 1/64),
 +            // small enough that the loop cannot oscillate.
@@ -193,15 +386,18 @@
 +            }
 +            const min_f = @divTrunc(qpc_freq * (1_000_000 - MAX_CORRECTION_PPM), 1_000_000);
 +            const max_f = @divTrunc(qpc_freq * (1_000_000 + MAX_CORRECTION_PPM), 1_000_000);
-+            eff_freq.store(@min(max_f, @max(min_f, f)), .release);
++            new_freq = @min(max_f, @max(min_f, f));
 +        }
 +
 +        // Re-anchor on the value being returned: the clock never jumps and
 +        // never pauses, only its rate is corrected.
-+        anchor_ft.store(ft, .release);
-+        anchor_qpc.store(now_qpc, .release);
-+        last_check_ft.store(ft, .release);
-+        last_sys_ft.store(sys_ft, .release);
++        anchorStore(.{
++            .ft = ft,
++            .qpc = now_qpc,
++            .check_ft = ft,
++            .sys_ft = sys_ft,
++            .freq = new_freq,
++        });
 +        return ft;
 +    }
 +
@@ -226,66 +422,92 @@
 +        slot_lock.store(0, .release);
 +    }
 +
-+    fn registerThread(tid: DWORD, handle: HANDLE) void {
++    /// Returns the auto-reset event for `tid`, creating it if this is the
++    /// first time the thread is seen.
++    ///
++    /// The event must be reachable by *both* the parking thread and the waker,
++    /// and it must exist before either of them runs, otherwise a wake-up that
++    /// arrives before the target thread has ever parked is dropped and that
++    /// thread then blocks forever. Windows 8 has no such window because
++    /// `NtAlertThreadByThreadId` sets a sticky per-thread alert flag that a
++    /// later `NtWaitForAlertByThreadId` consumes immediately. An auto-reset
++    /// event reproduces exactly that behaviour, but only if the waker can
++    /// signal it before the waiter appears, hence lazily creating it here
++    /// rather than in `parkFallback` alone.
++    ///
++    /// Returns null only if the event could not be created.
++    fn slotHandle(tid: DWORD) ?HANDLE {
 +        slotSpinLock();
 +        defer slotSpinUnlock();
 +        for (slots[0..slot_used]) |*s| {
-+            if (s.tid == tid) {
-+                s.handle = handle;
-+                return;
-+            }
++            if (s.tid == tid) return s.handle;
 +        }
++        const h = CreateEventW(null, 0, 0, null) orelse return null;
 +        if (slot_used < MAX_SLOTS) {
-+            slots[slot_used] = .{ .tid = tid, .handle = handle };
++            slots[slot_used] = .{ .tid = tid, .handle = h };
 +            slot_used += 1;
-+            return;
++            return h;
 +        }
-+        // Table full: replace round-robin. With 1024 slots this only happens
-+        // if the process has created (and leaked) that many parked threads.
++        // Table full: recycle round-robin. Thread ids are only reused after a
++        // thread exits, so with 1024 slots this needs that many live parked
++        // threads before an entry can be taken from a running one.
 +        const idx = slot_next;
 +        slot_next = (slot_next + 1) % MAX_SLOTS;
-+        slots[idx] = .{ .tid = tid, .handle = handle };
++        slots[idx] = .{ .tid = tid, .handle = h };
++        return h;
 +    }
 +
 +    fn wakeThread(tid: DWORD) void {
-+        slotSpinLock();
-+        defer slotSpinUnlock();
-+        for (slots[0..slot_used]) |s| {
-+            if (s.tid == tid) {
-+                if (s.handle) |h| _ = SetEvent(h);
-+                return;
-+            }
-+        }
++        // Creates the event if the target has not parked yet, so the wake-up
++        // is retained rather than lost.
++        if (slotHandle(tid)) |h| _ = SetEvent(h);
 +    }
 +
 +    /// `Timeout` is a Windows interval: negative for a relative duration,
 +    /// positive for an absolute deadline, `null` for infinite.
++    /// 100 ns units to milliseconds, rounded up and clamped below INFINITE
++    /// (which would mean "no timeout").
++    fn toMs(hundred_ns: i64) u32 {
++        return @intCast(@min(@divTrunc(hundred_ns + 9_999, 10_000), @as(i64, INFINITE - 1)));
++    }
++
 +    fn parkFallback(Timeout: ?*const LARGE_INTEGER) NTSTATUS {
++        // Cache the lookup per thread; the event itself lives in the shared
++        // table so that a waker can reach (and pre-signal) it.
 +        const handle = win7_alert_event orelse blk: {
-+            const h = CreateEventW(null, 0, 0, null) orelse return .TIMEOUT;
++            const h = slotHandle(GetCurrentThreadId()) orelse return .TIMEOUT;
 +            win7_alert_event = h;
 +            break :blk h;
 +        };
-+        if (!win7_alert_registered) {
-+            registerThread(GetCurrentThreadId(), handle);
-+            win7_alert_registered = true;
-+        }
 +        const ms: u32 = ms: {
 +            const v = (Timeout orelse break :ms INFINITE).*;
-+            if (v < 0) {
-+                // Relative duration in 100 ns units, round up.
-+                break :ms @intCast(@min(@divTrunc(-v + 9_999, 10_000), @as(i64, INFINITE - 1)));
-+            }
-+            // Absolute deadline in 100 ns since 1601; round the remaining time up.
++            // Negative: relative duration in 100 ns units. Used directly, so
++            // no clock read is involved and no rounding error accumulates.
++            if (v < 0) break :ms toMs(-v);
++            // Positive: absolute deadline in 100 ns units since 1601.
 +            const remaining = v - filetime();
 +            if (remaining <= 0) break :ms 0;
-+            break :ms @intCast(@min(@divTrunc(remaining + 9_999, 10_000), @as(i64, INFINITE - 1)));
++            break :ms toMs(remaining);
 +        };
-+        return if (WaitForSingleObject(handle, ms) == WAIT_TIMEOUT) .TIMEOUT else .ALERTED;
++        // Alertable, so queued APCs run while the thread is parked. This
++        // matches Windows 8 semantics: `NtWaitForAlertByThreadId` is an
++        // alertable wait, and `Io.Threaded` relies on that for every request
++        // issued with `nonblocking = true` (notably `accept`), which parks the
++        // thread and depends on an APC to signal completion.
++        //
++        // A wake-up caused by an APC is reported as `.ALERTED`, exactly like a
++        // real alert: callers of `park` always re-check their own condition
++        // and park again if it has not been satisfied, so a spurious wake-up
++        // is safe, whereas a missed APC is a deadlock.
++        return if (WaitForSingleObjectEx(handle, ms, 1) == WAIT_TIMEOUT) .TIMEOUT else .ALERTED;
 +    }
 +};
 +
-+pub fn NtWaitForAlertByThreadId(
++pub const NtWaitForAlertByThreadId = if (win7_fallback_needed) win7NtWaitForAlertByThreadId else nativeNtWaitForAlertByThreadId;
++
++const nativeNtWaitForAlertByThreadId = win7_native.NtWaitForAlertByThreadId;
++
++fn win7NtWaitForAlertByThreadId(
      Address: ?*const anyopaque,
      Timeout: ?*const LARGE_INTEGER,
 -) callconv(.winapi) NTSTATUS;
@@ -298,9 +520,14 @@
 +        var resolved: std.atomic.Value(bool) = .init(false);
 +        fn impl() ?Impl {
 +            if (resolved.load(.acquire)) return cached.load(.acquire);
-+            const p = win7.lookup(win7.ntdll_dll, "NtWaitForAlertByThreadId") orelse blk: {
++            // NOTE: this must `return null`, not `break :blk null`. Breaking
++            // out of the block merely yields a null `p`, and the `@ptrCast`
++            // below then converts null to a non-optional pointer, which
++            // panics with "cast causes pointer to be null" on exactly the
++            // systems this fallback exists for.
++            const p = win7.lookup(win7.ntdll_dll, "NtWaitForAlertByThreadId") orelse {
 +                resolved.store(true, .release);
-+                break :blk null;
++                return null;
 +            };
 +            const f: Impl = @ptrCast(p);
 +            cached.store(f, .release);
@@ -312,16 +539,25 @@
 +    return win7.parkFallback(Timeout);
 +}
 +
-+pub fn NtAlertThreadByThreadId(ThreadId: DWORD) callconv(.winapi) NTSTATUS {
++pub const NtAlertThreadByThreadId = if (win7_fallback_needed) win7NtAlertThreadByThreadId else nativeNtAlertThreadByThreadId;
++
++const nativeNtAlertThreadByThreadId = win7_native.NtAlertThreadByThreadId;
++
++fn win7NtAlertThreadByThreadId(ThreadId: DWORD) callconv(.winapi) NTSTATUS {
 +    const Impl = *const fn (DWORD) callconv(.winapi) NTSTATUS;
 +    const get = struct {
 +        var cached: std.atomic.Value(?Impl) = .init(null);
 +        var resolved: std.atomic.Value(bool) = .init(false);
 +        fn impl() ?Impl {
 +            if (resolved.load(.acquire)) return cached.load(.acquire);
-+            const p = win7.lookup(win7.ntdll_dll, "NtAlertThreadByThreadId") orelse blk: {
++            // NOTE: this must `return null`, not `break :blk null`. Breaking
++            // out of the block merely yields a null `p`, and the `@ptrCast`
++            // below then converts null to a non-optional pointer, which
++            // panics with "cast causes pointer to be null" on exactly the
++            // systems this fallback exists for.
++            const p = win7.lookup(win7.ntdll_dll, "NtAlertThreadByThreadId") orelse {
 +                resolved.store(true, .release);
-+                break :blk null;
++                return null;
 +            };
 +            const f: Impl = @ptrCast(p);
 +            cached.store(f, .release);
@@ -336,12 +572,16 @@
  pub extern "ntdll" fn NtAlertThread(ThreadHandle: HANDLE) callconv(.winapi) NTSTATUS;
  pub extern "ntdll" fn NtAlertMultipleThreadByThreadId(
      ThreadIds: [*]const ULONG_PTR,
-@@ -673,7 +994,28 @@
+@@ -673,7 +1205,37 @@
      Buffer: [*]u16,
  ) callconv(.winapi) ULONG;
  
 -pub extern "ntdll" fn RtlGetSystemTimePrecise() callconv(.winapi) LARGE_INTEGER;
-+pub fn RtlGetSystemTimePrecise() callconv(.winapi) LARGE_INTEGER {
++pub const RtlGetSystemTimePrecise = if (win7_fallback_needed) win7RtlGetSystemTimePrecise else nativeRtlGetSystemTimePrecise;
++
++const nativeRtlGetSystemTimePrecise = win7_native.RtlGetSystemTimePrecise;
++
++fn win7RtlGetSystemTimePrecise() callconv(.winapi) LARGE_INTEGER {
 +    // `LARGE_INTEGER` is `i64`. On Windows 8+ this resolves to the native
 +    // implementation; on Windows 7 and older it is the QPC + system-time
 +    // hybrid clock from `win7.filetime()`.
@@ -351,9 +591,14 @@
 +        var resolved: std.atomic.Value(bool) = .init(false);
 +        fn impl() ?Impl {
 +            if (resolved.load(.acquire)) return cached.load(.acquire);
-+            const p = win7.lookup(win7.ntdll_dll, "RtlGetSystemTimePrecise") orelse blk: {
++            // NOTE: this must `return null`, not `break :blk null`. Breaking
++            // out of the block merely yields a null `p`, and the `@ptrCast`
++            // below then converts null to a non-optional pointer, which
++            // panics with "cast causes pointer to be null" on exactly the
++            // systems this fallback exists for.
++            const p = win7.lookup(win7.ntdll_dll, "RtlGetSystemTimePrecise") orelse {
 +                resolved.store(true, .release);
-+                break :blk null;
++                return null;
 +            };
 +            const f: Impl = @ptrCast(p);
 +            cached.store(f, .release);
