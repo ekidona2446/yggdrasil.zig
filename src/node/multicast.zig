@@ -50,7 +50,7 @@ const IFF_MULTICAST: c_uint = switch (builtin.os.tag) {
     .linux, .windows => 0x1000,
     // macOS / BSD use a different bit for IFF_MULTICAST.
     .macos, .ios, .maccatalyst, .tvos, .visionos, .watchos,
-    .freebsd, .netbsd, .openbsd, .dragonfly, .illumos,
+	.freebsd, .netbsd, .openbsd, .dragonfly, .illumos,
     => 0x8000,
     else => 0x1000,
 };
@@ -65,7 +65,7 @@ const ipv6_mreq = extern struct {
 const IPV6_JOIN_GROUP: u32 = switch (builtin.os.tag) {
     .linux => 20,
     .windows, .macos, .ios, .maccatalyst, .tvos, .visionos, .watchos,
-    .freebsd, .netbsd, .openbsd, .dragonfly, .illumos,
+	.freebsd, .netbsd, .openbsd, .dragonfly, .illumos,
     => 12,
     else => 20,
 };
@@ -74,7 +74,7 @@ const IPV6_JOIN_GROUP: u32 = switch (builtin.os.tag) {
 const IPV6_LEAVE_GROUP: u32 = switch (builtin.os.tag) {
     .linux => 21,
     .windows, .macos, .ios, .maccatalyst, .tvos, .visionos, .watchos,
-    .freebsd, .netbsd, .openbsd, .dragonfly, .illumos,
+	.freebsd, .netbsd, .openbsd, .dragonfly, .illumos,
     => 13,
     else => 21,
 };
@@ -90,7 +90,10 @@ const SockaddrIn6 = extern struct {
     scope_id: u32,
 };
 
-const AF_INET6: u16 = 10;
+const AF_INET6: u16 = if (builtin.os.tag == .windows) 23 else 10;
+const win_socket = struct {
+    extern "ws2_32" fn socket(c_int, c_int, c_int) callconv(.winapi) usize;
+};
 
 /// One candidate interface, as enumerated by the platform backends below.
 /// `name` is borrowed from the platform's own buffer on POSIX and owned by the
@@ -176,7 +179,7 @@ const win_if = struct {
         dns_suffix: [*:0]u16,
         description: [*:0]u16,
         friendly_name: [*:0]u16,
-        physical_address: [16]u8,
+        physical_address: [8]u8, // MAX_ADAPTER_ADDRESS_LENGTH
         physical_address_length: u32,
         flags: u32,
         mtu: u32,
@@ -194,7 +197,7 @@ const win_if = struct {
         size: *u32,
     ) callconv(.winapi) u32;
 
-    const AF_INET6_WIN: u32 = 23;
+    const AF_INET6_WIN: u32 = AF_INET6;
     const GAA_SKIP: u32 = 0x2 | 0x4 | 0x8; // anycast | multicast | dns server
     const ERROR_BUFFER_OVERFLOW: u32 = 111;
     const IF_OPER_STATUS_UP: u32 = 1;
@@ -205,11 +208,14 @@ const win_if = struct {
 
     fn enumerate(gpa: std.mem.Allocator) ![]RawIf {
         var out: std.ArrayListUnmanaged(RawIf) = .empty;
-        errdefer out.deinit(gpa);
+        errdefer {
+            for (out.items) |item| gpa.free(item.name);
+            out.deinit(gpa);
+        }
 
         var size: u32 = 16 * 1024;
         var buf: []u8 = try gpa.alloc(u8, size);
-        errdefer gpa.free(buf);
+        defer gpa.free(buf);
         var rc: u32 = 0;
         while (true) {
             rc = GetAdaptersAddresses(AF_INET6_WIN, GAA_SKIP, null, buf.ptr, &size);
@@ -217,7 +223,6 @@ const win_if = struct {
             buf = gpa.realloc(buf, size) catch return error.EnumerationFailed;
         }
         if (rc != 0) return error.EnumerationFailed;
-        defer gpa.free(buf);
 
         var adapter: ?*ADAPTER_ADDRESSES = @ptrCast(@alignCast(buf.ptr));
         while (adapter) |a| : (adapter = a.next) {
@@ -233,8 +238,10 @@ const win_if = struct {
                 if (sa.family != AF_INET6) continue;
                 if (!isLinkLocal(&sa.addr)) continue;
 
+                const owned_name = try adapterName(gpa, a);
+                errdefer gpa.free(owned_name);
                 try out.append(gpa, .{
-                    .name = adapterName(gpa, a),
+                    .name = owned_name,
                     .index = a.ipv6_if_index,
                     .addr = sa.addr,
                     .up = up,
@@ -251,13 +258,13 @@ const win_if = struct {
     /// Prefer the friendly name ("Ethernet 2") -- that is what a Windows user
     /// would write in `MulticastInterfaces` -- falling back to the adapter
     /// GUID when the system has no friendly name for it.
-    fn adapterName(gpa: std.mem.Allocator, a: *const ADAPTER_ADDRESSES) []const u8 {
+    fn adapterName(gpa: std.mem.Allocator, a: *const ADAPTER_ADDRESSES) ![]const u8 {
         const friendly = std.mem.span(a.friendly_name);
         if (friendly.len > 0) {
             return std.unicode.utf16LeToUtf8Alloc(gpa, friendly) catch
-                std.mem.span(a.adapter_name);
+                gpa.dupe(u8, std.mem.span(a.adapter_name));
         }
-        return std.mem.span(a.adapter_name);
+        return gpa.dupe(u8, std.mem.span(a.adapter_name));
     }
 };
 
@@ -429,9 +436,15 @@ pub const Multicast = struct {
     /// Open the socket, join the multicast groups, and start the driver timer.
     pub fn start(self: *Multicast) !void {
         if (self.running) return;
-        const rc = c.socket(AF_INET6, c.SOCK.DGRAM | SOCK_CLOEXEC, 0);
-        if (rc < 0) return error.SocketFailed;
-        const fd = udp_io.socketFromRc(rc);
+        const fd: std.posix.socket_t = if (comptime builtin.os.tag == .windows) blk: {
+            const h = win_socket.socket(AF_INET6, c.SOCK.DGRAM, 0);
+            if (h == std.math.maxInt(usize)) return error.SocketFailed;
+            break :blk @ptrFromInt(h);
+        } else blk: {
+            const rc = c.socket(AF_INET6, c.SOCK.DGRAM | SOCK_CLOEXEC, 0);
+            if (rc < 0) return error.SocketFailed;
+            break :blk udp_io.socketFromRc(rc);
+        };
         self.sock = fd;
         self.sock_open = true;
         if (comptime builtin.os.tag == .windows) {
@@ -824,4 +837,19 @@ test "link local detection" {
     const global = [_]u8{ 0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
     try testing.expect(isLinkLocal(&fe80));
     try testing.expect(!isLinkLocal(&global));
+}
+
+// Enforced in every Windows x64 build, not only when `zig test` runs. Values
+// correspond to WinSDK IP_ADAPTER_ADDRESSES and sockaddr_in6.
+comptime {
+    if (builtin.os.tag == .windows and @sizeOf(usize) == 8) {
+        if (AF_INET6 != 23 or @sizeOf(SockaddrIn6) != 28 or
+            @offsetOf(SockaddrIn6, "addr") != 8 or
+            @offsetOf(win_if.ADAPTER_ADDRESSES, "physical_address") != 80 or
+            @offsetOf(win_if.ADAPTER_ADDRESSES, "physical_address_length") != 88 or
+            @offsetOf(win_if.ADAPTER_ADDRESSES, "if_type") != 100 or
+            @offsetOf(win_if.ADAPTER_ADDRESSES, "oper_status") != 104 or
+            @offsetOf(win_if.ADAPTER_ADDRESSES, "ipv6_if_index") != 108)
+            @compileError("Windows IPv6/IP_ADAPTER_ADDRESSES ABI mismatch");
+    }
 }

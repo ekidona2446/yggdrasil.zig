@@ -56,6 +56,70 @@ const Config = node.config.Config;
 const ctl = @import("ctl");
 const is_windows = builtin.os.tag == .windows;
 
+/// Process-scoped Winsock initialisation. WSAStartup/WSACleanup are reference
+/// counted by Windows; keep this reference until every user has shut down.
+const winsock = struct {
+    const win = struct {
+        extern "ws2_32" fn WSAStartup(version: u16, data: *anyopaque) callconv(.winapi) c_int;
+        extern "ws2_32" fn WSACleanup() callconv(.winapi) c_int;
+    };
+
+    fn init() !void {
+        if (comptime is_windows) {
+            // Opaque buffer larger than WSADATA on both Win32 and Win64; only
+            // the API writes it and no layout-dependent fields are inspected.
+            var data: [512]u64 = undefined;
+            const rc = win.WSAStartup(0x0202, @ptrCast(&data));
+            if (rc != 0) return error.WinsockInitializationFailed;
+        }
+    }
+
+    fn deinit() void {
+        if (comptime is_windows) _ = win.WSACleanup();
+    }
+};
+
+/// Windows elevation check for a requested TUN. Do not run it for --tun none.
+const windows_security = struct {
+    const win = std.os.windows;
+    extern "kernel32" fn GetCurrentProcess() callconv(.winapi) win.HANDLE;
+    extern "kernel32" fn CloseHandle(win.HANDLE) callconv(.winapi) i32;
+    extern "advapi32" fn OpenProcessToken(win.HANDLE, u32, *win.HANDLE) callconv(.winapi) i32;
+    extern "advapi32" fn GetTokenInformation(win.HANDLE, u32, *anyopaque, u32, *u32) callconv(.winapi) i32;
+
+    fn isElevated() !bool {
+        const TOKEN_QUERY = 0x0008;
+        const TokenElevation = 20;
+        var token: win.HANDLE = undefined;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) == 0) return error.TokenQueryFailed;
+        defer _ = CloseHandle(token);
+        var elevated: u32 = 0;
+        var returned: u32 = 0;
+        if (GetTokenInformation(token, TokenElevation, @ptrCast(&elevated), @sizeOf(u32), &returned) == 0)
+            return error.TokenQueryFailed;
+        return elevated != 0;
+    }
+};
+
+// A console handler runs on a Windows-created thread. It only stores a flag;
+// the libxev loop is stopped on its own thread by the maintenance timer.
+const windows_shutdown = struct {
+    var requested: std.atomic.Value(bool) = .init(false);
+    extern "kernel32" fn SetConsoleCtrlHandler(?*const fn (u32) callconv(.winapi) i32, i32) callconv(.winapi) i32;
+    fn handler(event: u32) callconv(.winapi) i32 {
+        if (event != 0 and event != 1) return 0; // Ctrl+C / Ctrl+Break only
+        requested.store(true, .release);
+        return 1;
+    }
+    fn install() !void {
+        requested.store(false, .release);
+        if (SetConsoleCtrlHandler(handler, 1) == 0) return error.ConsoleHandlerFailed;
+    }
+    fn uninstall() void {
+        _ = SetConsoleCtrlHandler(handler, 0);
+    }
+};
+
 const MAINTENANCE_INTERVAL_MS: u64 = 1000;
 const TUN_READ_BUF_SIZE: usize = 65535 + 4;
 const YGGDRASIL_ZIG_VERSION: []const u8 = "0.0.1-dev";
@@ -64,7 +128,11 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
 
-    var cli = try parseArgs(gpa, init.minimal.args);
+    // Windows argument slices belong to the iterator. Keep it alive until
+    // every Cli user (including the event loop) has finished.
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
+    defer args.deinit();
+    var cli = try parseArgs(gpa, &args);
     defer cli.deinit(gpa);
 
     switch (cli.action) {
@@ -84,6 +152,8 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("ctl: no command given (try 'yggdrasil getSelf')\n", .{});
                 return error.InvalidArgument;
             }
+            try winsock.init();
+            defer winsock.deinit();
             const endpoint = cli.ctl_endpoint orelse ctl.default_endpoint;
             ctl.run(gpa, io, endpoint, cli.ctl_command.?, cli.ctl_args.items, cli.json_output) catch |err| {
                 // The ctl module already printed a diagnostic; exit non-zero.
@@ -161,6 +231,9 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    try winsock.init();
+    defer winsock.deinit();
+
     // -- Merge CLI overrides on top of file config ------------------------
     var effective_peers = std.ArrayListUnmanaged([]const u8).empty;
     defer effective_peers.deinit(gpa);
@@ -228,9 +301,26 @@ pub fn main(init: std.process.Init) !void {
 
     // -- TUN setup ------------------------------------------------------
     var tun_adapter: ?TunAdapter = null;
+    defer if (tun_adapter) |*t| t.deinit();
     if (!std.mem.eql(u8, tun_name, "none")) {
+        if (comptime is_windows) {
+            const elevated = windows_security.isElevated() catch |err| {
+                std.debug.print("[ygg] cannot check administrator elevation: {}\n", .{err});
+                return err;
+            };
+            if (!elevated) {
+                std.debug.print("[ygg] administrator privileges are required for TUN; run as administrator or configure --tun none.\n", .{});
+                return error.AdministratorRequired;
+            }
+        }
         tun_adapter = TunAdapter.init(tun_name, "", @intCast(mtu)) catch |err| blk: {
-            std.debug.print("[ygg] warning: failed to create TUN device ({}); continuing without TUN (mesh routing still active)\n", .{err});
+            if (comptime is_windows) {
+                std.debug.print("[ygg] failed to create TUN device ({}); check privileges, driver and interface name. Use --tun none only for intentional no-TUN mode.\n", .{err});
+                return err;
+            }
+            // Preserve the existing Unix policy; Windows explicitly refuses
+            // to continue without a TUN when one was requested.
+            std.debug.print("[ygg] warning: failed to create TUN device ({}); continuing without TUN\n", .{err});
             break :blk null;
         };
         if (tun_adapter) |*t| {
@@ -269,9 +359,14 @@ pub fn main(init: std.process.Init) !void {
         tun_io = try TunIo.init(gpa, &app, &loop, t);
         app.tun = &tun_io.?;
         app.tun_adapter = t;
-        tun_io.?.start(&loop);
     }
     defer if (tun_io) |*t| t.deinit();
+    if (tun_io) |*t| {
+        if (comptime is_windows) {
+            try t.startReader();
+        }
+        t.start(&loop);
+    }
 
     // -- CKR system routes (best-effort) ----------------------------------
     if (ckr_table != null) {
@@ -329,6 +424,8 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("[ygg] warning: admin socket {s} unavailable ({}); yggdrasilctl will not work\n", .{ admin_listen, err });
     }
 
+    if (comptime is_windows) try windows_shutdown.install();
+    defer if (comptime is_windows) windows_shutdown.uninstall();
     std.debug.print("status: running (press Ctrl+C to stop)\n", .{});
 
     // -- Maintenance timer --------------------------------------------------
@@ -357,18 +454,18 @@ fn emitConfig(gpa: std.mem.Allocator, io: std.Io, cfg: *const Config, json_outpu
 
     const bytes = w.written();
     if (maybe_path) |path| {
-        if (no_replace) {
-            if (std.Io.Dir.cwd().access(io, path, .{})) |_| {
+        var file = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true, .exclusive = no_replace }) catch |err| {
+            if (no_replace and err == error.PathAlreadyExists) {
                 std.debug.print("{s} already exists; not overwriting (--no-replace)\n", .{path});
-                return;
-            } else |_| {}
-        }
-        var file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+            }
+            return err;
+        };
         defer file.close(io);
         try file.writeStreamingAll(io, bytes);
         std.debug.print("wrote config to {s}\n", .{path});
     } else {
-        std.debug.print("{s}\n", .{bytes});
+        try std.Io.File.stdout().writeStreamingAll(io, bytes);
+        try std.Io.File.stdout().writeStreamingAll(io, "\n");
     }
 }
 
@@ -441,6 +538,12 @@ const MaintenanceCtx = struct {
     fn onTick(ud: ?*MaintenanceCtx, loop: *xev.Loop, c: *xev.Completion, r: xev.Timer.RunError!void) xev.CallbackAction {
         _ = r catch {};
         const ctx = ud.?;
+        if (comptime is_windows) {
+            if (windows_shutdown.requested.load(.acquire)) {
+                loop.stop();
+                return .disarm;
+            }
+        }
         ctx.net.runMaintenance() catch |err| {
             std.debug.print("[ygg] maintenance error: {}\n", .{err});
         };
@@ -598,20 +701,22 @@ const TunIoWindows = struct {
     wake: xev.Async,
     wake_completion: xev.Completion = undefined,
 
-    /// Only sets up fields (including spawning the Wintun reader thread);
-    /// does not arm the wake-wait. Call `start` once `self` is at its
-    /// final, stable storage address (same reasoning as `TunIoUnix.init`).
+    /// Initialise without spawning: the reader must receive pointers into the
+    /// final, stable TunIoWindows storage, never to this temporary value.
     fn init(gpa: std.mem.Allocator, app: *App, loop: *xev.Loop, adapter: *TunAdapter) !TunIoWindows {
         _ = loop;
-        var self = TunIoWindows{
+        const self = TunIoWindows{
             .app = app,
             .adapter = adapter,
             .gpa = gpa,
             .queue = .{ .gpa = gpa },
             .wake = try xev.Async.init(),
         };
-        try adapter.native.startReaderThread(gpa, &self.queue, &self.wake);
         return self;
+    }
+
+    fn startReader(self: *TunIoWindows) !void {
+        try self.adapter.native.startReaderThread(self.gpa, &self.queue, &self.wake);
     }
 
     fn start(self: *TunIoWindows, loop: *xev.Loop) void {
@@ -648,6 +753,9 @@ const TunIoWindows = struct {
     }
 
     fn deinit(self: *TunIoWindows) void {
+        // Stop/join reader before destroying the queue or its wake handle.
+        self.adapter.deinit();
+        while (self.queue.pop()) |pkt| self.gpa.free(pkt.data);
         self.wake.deinit();
     }
 };
@@ -746,10 +854,9 @@ fn printUsage() void {
     , .{});
 }
 
-fn parseArgs(gpa: std.mem.Allocator, raw_args: std.process.Args) !Cli {
+fn parseArgs(gpa: std.mem.Allocator, args: *std.process.Args.Iterator) !Cli {
     var cli = Cli{};
-    var args = try std.process.Args.Iterator.initAllocator(raw_args, gpa);
-    defer args.deinit();
+    errdefer cli.deinit(gpa);
     _ = args.next();
 
     while (args.next()) |arg| {
@@ -769,12 +876,12 @@ fn parseArgs(gpa: std.mem.Allocator, raw_args: std.process.Args) !Cli {
             // no `peek()`, but on POSIX it's a trivially-copyable index
             // into argv, so we can "peek" by copying, trying `next()`, and
             // restoring the copy if it turns out to be another flag.
-            const saved = args;
+            const saved = args.*;
             if (args.next()) |maybe_file| {
                 if (maybe_file.len > 0 and maybe_file[0] != '-') {
                     cli.genconf = maybe_file;
                 } else {
-                    args = saved;
+                    args.* = saved;
                     cli.genconf = @as(?[]const u8, null);
                 }
             } else {
@@ -832,4 +939,35 @@ fn eqAny(arg: []const u8, options: []const []const u8) bool {
         if (std.mem.eql(u8, arg, o)) return true;
     }
     return false;
+}
+
+test "Windows CLI argument storage survives parsing" {
+    if (comptime !is_windows) return error.SkipZigTest;
+    const line = std.unicode.utf8ToUtf16LeStringLiteral(
+        "yggdrasil.exe -c yggdrasil.toml -e tcp://[::1]:9001 getSelf",
+    );
+    const raw: std.process.Args = .{ .vector = line[0..line.len] };
+    var it = try std.process.Args.Iterator.initAllocator(raw, std.testing.allocator);
+    defer it.deinit();
+    var cli = try parseArgs(std.testing.allocator, &it);
+    defer cli.deinit(std.testing.allocator);
+    // Exercise another allocation before accessing the stored argument slices.
+    const scratch = try std.testing.allocator.alloc(u8, 4096);
+    defer std.testing.allocator.free(scratch);
+    @memset(scratch, 0xaa);
+    try std.testing.expectEqualStrings("yggdrasil.toml", cli.useconffile.?);
+    try std.testing.expectEqualStrings("tcp://[::1]:9001", cli.ctl_endpoint.?);
+    try std.testing.expectEqualStrings("getSelf", cli.ctl_command.?);
+}
+
+test "Windows -g lookahead leaves following flag intact" {
+    if (comptime !is_windows) return error.SkipZigTest;
+    const line = std.unicode.utf8ToUtf16LeStringLiteral("yggdrasil.exe -g -c yggdrasil.toml");
+    const raw: std.process.Args = .{ .vector = line[0..line.len] };
+    var it = try std.process.Args.Iterator.initAllocator(raw, std.testing.allocator);
+    defer it.deinit();
+    var cli = try parseArgs(std.testing.allocator, &it);
+    defer cli.deinit(std.testing.allocator);
+    try std.testing.expect(cli.genconf != null and cli.genconf.? == null);
+    try std.testing.expectEqualStrings("yggdrasil.toml", cli.useconffile.?);
 }

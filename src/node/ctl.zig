@@ -66,6 +66,9 @@ pub fn run(
     args: []const []const u8,
     json_output: bool,
 ) !void {
+    if (comptime @import("builtin").os.tag == .windows)
+        return runWindows(gpa, endpoint, command, args, json_output);
+
     var stream = connect(gpa, io, endpoint) catch |err| {
         emitErr("ctl: cannot reach admin socket {s}: {}\n", .{ endpoint, err });
         return err;
@@ -108,18 +111,115 @@ pub fn run(
             break;
         } else |_| {} // partial: keep going
     }
-    if (std.mem.trim(u8, reply.items, " \t\r\n").len == 0) {
+    try decodeReply(gpa, endpoint, command, json_output, reply.items);
+}
+
+fn decodeReply(gpa: std.mem.Allocator, endpoint: []const u8, command: []const u8, json_output: bool, reply: []const u8) !void {
+    if (std.mem.trim(u8, reply, " \t\r\n").len == 0) {
         emitErr("ctl: empty response from {s}\n", .{endpoint});
         return error.EmptyResponse;
     }
 
-    var parsed = std.json.parseFromSlice(std.json.Value, gpa, reply.items, .{}) catch |err| {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, reply, .{}) catch |err| {
         emitErr("ctl: {s} sent a reply that is not JSON: {}\n", .{ endpoint, err });
         return err;
     };
     defer parsed.deinit();
 
     try printReply(gpa, command, parsed.value, json_output);
+}
+
+// Windows CTL uses documented synchronous Winsock, avoiding std.Io's AFD
+// device path on older Windows. The process owns a WSAStartup reference.
+const win_ctl = struct {
+    const Socket = usize;
+    const invalid = std.math.maxInt(Socket);
+    const Sock4 = extern struct { family: u16, port: u16, address: [4]u8, zero: [8]u8 = @splat(0) };
+    const Sock6 = extern struct { family: u16, port: u16, flow: u32 = 0, address: [16]u8, scope: u32 = 0 };
+    extern "ws2_32" fn socket(c_int, c_int, c_int) callconv(.winapi) Socket;
+    extern "ws2_32" fn connect(Socket, *const anyopaque, c_int) callconv(.winapi) c_int;
+    extern "ws2_32" fn closesocket(Socket) callconv(.winapi) c_int;
+    extern "ws2_32" fn send(Socket, [*]const u8, c_int, c_int) callconv(.winapi) c_int;
+    extern "ws2_32" fn recv(Socket, [*]u8, c_int, c_int) callconv(.winapi) c_int;
+    extern "ws2_32" fn WSAGetLastError() callconv(.winapi) c_int;
+};
+
+fn runWindows(gpa: std.mem.Allocator, endpoint: []const u8, command: []const u8, args: []const []const u8, json_output: bool) !void {
+    if (std.mem.startsWith(u8, endpoint, "unix://")) {
+        unix_socket.reportUnsupported("admin endpoint", endpoint);
+        return error.Unsupported;
+    }
+    const rest = if (std.mem.startsWith(u8, endpoint, "tcp://")) endpoint["tcp://".len..] else endpoint;
+    if (rest.len == 0) return error.InvalidEndpoint;
+    const hp = try splitHostPort(rest);
+    const addrs = dns.resolve(gpa, hp.host, hp.port) catch |err| {
+        emitErr("ctl: resolve {s}: {}\n", .{ hp.host, err });
+        return err;
+    };
+    defer gpa.free(addrs);
+    var sock: win_ctl.Socket = win_ctl.invalid;
+    var last_wsa: c_int = 0;
+    for (addrs) |addr| {
+        const family: c_int = switch (addr) {
+            .ip4 => 2,
+            .ip6 => 23,
+        };
+        const candidate = win_ctl.socket(family, 1, 6);
+        if (candidate == win_ctl.invalid) {
+            last_wsa = win_ctl.WSAGetLastError();
+            continue;
+        }
+        const rc = switch (addr) {
+            .ip4 => |a| blk: {
+                const sa: win_ctl.Sock4 = .{ .family = 2, .port = std.mem.nativeToBig(u16, a.port), .address = a.bytes };
+                break :blk win_ctl.connect(candidate, &sa, @sizeOf(win_ctl.Sock4));
+            },
+            .ip6 => |a| blk: {
+                const sa: win_ctl.Sock6 = .{ .family = 23, .port = std.mem.nativeToBig(u16, a.port), .flow = a.flow, .address = a.bytes, .scope = a.interface.index };
+                break :blk win_ctl.connect(candidate, &sa, @sizeOf(win_ctl.Sock6));
+            },
+        };
+        if (rc == 0) {
+            sock = candidate;
+            break;
+        }
+        last_wsa = win_ctl.WSAGetLastError();
+        _ = win_ctl.closesocket(candidate);
+    }
+    if (sock == win_ctl.invalid) {
+        emitErr("ctl: connect to {s} failed (WSA error {d})\n", .{ endpoint, last_wsa });
+        return error.ConnectionFailed;
+    }
+    defer _ = win_ctl.closesocket(sock);
+    const request = try buildRequest(gpa, command, args);
+    defer gpa.free(request);
+    var sent: usize = 0;
+    while (sent < request.len) {
+        const n = win_ctl.send(sock, request.ptr + sent, @intCast(@min(request.len - sent, std.math.maxInt(c_int))), 0);
+        if (n <= 0) {
+            emitErr("ctl: send failed (WSA error {d})\n", .{win_ctl.WSAGetLastError()});
+            return error.WriteFailed;
+        }
+        sent += @intCast(n);
+    }
+    var reply = std.ArrayListUnmanaged(u8).empty;
+    defer reply.deinit(gpa);
+    var chunk: [8192]u8 = undefined;
+    while (reply.items.len < reply_buffer_len) {
+        const limit = @min(chunk.len, reply_buffer_len - reply.items.len);
+        const n = win_ctl.recv(sock, &chunk, @intCast(limit), 0);
+        if (n < 0) {
+            emitErr("ctl: receive failed (WSA error {d})\n", .{win_ctl.WSAGetLastError()});
+            return error.ReadFailed;
+        }
+        if (n == 0) break;
+        try reply.appendSlice(gpa, chunk[0..@intCast(n)]);
+        if (std.json.parseFromSlice(std.json.Value, gpa, reply.items, .{})) |parsed| {
+            parsed.deinit();
+            break;
+        } else |_| {}
+    }
+    try decodeReply(gpa, endpoint, command, json_output, reply.items);
 }
 
 // ---------------------------------------------------------------------------
@@ -571,4 +671,15 @@ test "number and duration rendering" {
 test "padding" {
     try std.testing.expectEqualStrings("ab        ", pad(10, "ab")[0..]);
     try std.testing.expectEqualStrings("abcdefghij", pad(10, "abcdefghijklmn")[0..]);
+}
+
+// Compile-time regression check for the bracketed Windows loopback endpoint.
+comptime {
+    if (@import("builtin").os.tag == .windows) {
+        if (@sizeOf(win_ctl.Sock4) != 16 or @sizeOf(win_ctl.Sock6) != 28 or @offsetOf(win_ctl.Sock6, "address") != 8 or @offsetOf(win_ctl.Sock6, "scope") != 24)
+            @compileError("Windows CTL sockaddr ABI mismatch");
+        const hp = splitHostPort("[::1]:9001") catch @compileError("cannot parse IPv6 admin endpoint");
+        if (!std.mem.eql(u8, hp.host, "::1") or hp.port != 9001)
+            @compileError("incorrect IPv6 admin endpoint parsing");
+    }
 }

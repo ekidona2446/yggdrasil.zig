@@ -216,6 +216,7 @@ pub const NativeTun = struct {
         };
 
         const api = try Api.load();
+        errdefer _ = FreeLibrary(api.dll);
 
         var name_buf: [16:0]u8 = .{0} ** 16;
         // Use capitalised "Yggdrasil" by default to match the reference implementation adapter name.
@@ -259,6 +260,10 @@ pub const NativeTun = struct {
         self.recv_queue = queue;
         self.wake = wake;
         self.stop_event = CreateEventW(null, 1, 0, null) orelse return error.TunSetupFailed;
+        errdefer {
+            _ = CloseHandle(self.stop_event.?);
+            self.stop_event = null;
+        }
         self.reader_thread = try std.Thread.spawn(.{}, readerLoop, .{ self, gpa });
     }
 
@@ -267,17 +272,21 @@ pub const NativeTun = struct {
         const session = self.session orelse return;
         const read_wait_event = self.api.getReadWaitEvent(session);
         const stop_event = self.stop_event orelse return;
-        var handles = [_]HANDLE{ read_wait_event, stop_event };
+        // Prefer the stop event when both handles are signalled. Also check
+        // inside the drain loop so continuous traffic cannot prevent join.
+        var handles = [_]HANDLE{ stop_event, read_wait_event };
         while (true) {
+            if (WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0) return;
             var size: DWORD = 0;
             while (self.api.receivePacket(session, &size)) |packet| {
                 if (self.recv_queue) |q| q.push(packet[0..size]);
                 self.api.releaseReceivePacket(session, packet);
                 if (self.wake) |w| w.notify() catch {};
+                if (WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0) return;
             }
             // ERROR_NO_MORE_ITEMS: wait for more data (or shutdown).
             const rc = waitForMultiple(&handles, INFINITE);
-            if (rc == 1) return; // stop_event signaled
+            if (rc == 0) return; // stop_event signaled
         }
     }
 
@@ -296,6 +305,7 @@ pub const NativeTun = struct {
         if (self.stop_event) |ev| _ = CloseHandle(ev);
         if (self.session) |s| self.api.endSession(s);
         if (self.adapter) |a| self.api.closeAdapter(a);
+        _ = FreeLibrary(self.api.dll);
         self.enabled = false;
     }
 
@@ -357,7 +367,7 @@ const MIB_UNICASTIPADDRESS_ROW = extern struct {
     ValidLifetime: u32 = 0xFFFFFFFF,
     PreferredLifetime: u32 = 0xFFFFFFFF,
     OnLinkPrefixLength: u8,
-    SkipAsSource: BOOL = 0,
+    SkipAsSource: u8 = 0, // BOOLEAN, not Win32 BOOL
     DadState: u32 = 0,
     ScopeId: u32 = 0,
     CreationTimeStamp: i64 = 0,
@@ -389,4 +399,17 @@ fn createUnicastAddress(luid: NET_LUID, addr: node.Address) !void {
     row.PreferredLifetime = 0xFFFFFFFF;
     const status = CreateUnicastIpAddressEntry(&row);
     if (status != 0) return error.SetAddrFailed;
+}
+
+// WinSDK x64 layout. This is evaluated when the Windows backend is built.
+comptime {
+    if (@sizeOf(usize) == 8) {
+        if (@sizeOf(SOCKADDR_IN6) != 28 or
+            @sizeOf(MIB_UNICASTIPADDRESS_ROW) != 80 or
+            @offsetOf(MIB_UNICASTIPADDRESS_ROW, "InterfaceLuid") != 32 or
+            @offsetOf(MIB_UNICASTIPADDRESS_ROW, "OnLinkPrefixLength") != 60 or
+            @offsetOf(MIB_UNICASTIPADDRESS_ROW, "SkipAsSource") != 61 or
+            @offsetOf(MIB_UNICASTIPADDRESS_ROW, "DadState") != 64)
+            @compileError("Windows MIB_UNICASTIPADDRESS_ROW ABI mismatch");
+    }
 }

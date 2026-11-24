@@ -10,8 +10,8 @@
 //! On Windows, `std.c.addrinfo` resolves to `ws2_32.addrinfo` -- a type this
 //! Zig version's `ws2_32.zig` doesn't actually define -- so this module
 //! declares the handful of Winsock2 `getaddrinfo`/`freeaddrinfo` pieces it
-//! needs directly (matching the public, stable `ws2tcpip.h` ABI). `libxev`
-//! already calls `WSAStartup` before any of this runs.
+//! needs directly (matching the public, stable `ws2tcpip.h` ABI). Callers on
+//! Windows must hold a process Winsock reference before calling resolve.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -178,4 +178,15 @@ test "resolve literal ipv4" {
     defer gpa.free(addrs);
     try testing.expectEqual(@as(usize, 1), addrs.len);
     try testing.expectEqual(@as(u16, 1234), addrs[0].getPort());
+}
+
+comptime {
+    if (is_windows and @sizeOf(usize) == 8) {
+        if (@sizeOf(win.addrinfo) != 48 or
+            @offsetOf(win.addrinfo, "addrlen") != 16 or
+            @offsetOf(win.addrinfo, "canonname") != 24 or
+            @offsetOf(win.addrinfo, "addr") != 32 or
+            @offsetOf(win.addrinfo, "next") != 40)
+            @compileError("Windows ADDRINFOA ABI mismatch");
+    }
 }
